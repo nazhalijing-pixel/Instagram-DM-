@@ -1,0 +1,67 @@
+{
+  "entities": {
+    "automations": {
+      "title": "Automations",
+      "description": "Instagram DM and comment automations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "trigger_type": { "type": "string" },
+        "status": { "type": "string" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "name", "trigger_type", "status"]
+    },
+    "contacts": {
+      "title": "Contacts",
+      "description": "Captured Instagram contacts and leads",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ig_username": { "type": "string" },
+        "ig_user_id": { "type": "string" },
+        "first_interaction_at": { "type": "string" },
+        "last_interaction_at": { "type": "string" }
+      },
+      "required": ["id", "ig_username"]
+    },
+    "inbox_messages": {
+      "title": "Inbox Messages",
+      "description": "Instagram DM and comment thread messages",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "from_username": { "type": "string" },
+        "message_text": { "type": "string" },
+        "direction": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "message_text", "direction", "timestamp"]
+    },
+    "webhook_logs": {
+      "title": "Webhook Logs",
+      "description": "Meta webhook event logs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "trigger_type": { "type": "string" },
+        "from_username": { "type": "string" },
+        "incoming_text": { "type": "string" },
+        "status": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "status", "timestamp"]
+    },
+    "app_settings": {
+      "title": "App Settings",
+      "description": "Application settings and user profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" }
+      },
+      "required": ["id"]
+    }
+  }
+}
