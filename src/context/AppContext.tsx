@@ -11,26 +11,32 @@ import {
   GeminiApiKeyItem,
 } from '../types';
 import {
-  initialUser,
-  initialInstagramAccount,
-  initialAutomations,
-  initialContacts,
-  initialInboxMessages,
-  initialMetaConfig,
-  initialLogs,
-  initialGeminiKeys,
-} from '../lib/mockData';
-import {
-  subscribeToCollection,
-  saveDocument,
-  removeDocument,
-  saveMultipleDocuments,
+  auth,
+  signOut,
+  onAuthStateChanged,
+  signInAnonymously,
+  User,
+  subscribeToUserCollection,
+  saveUserDocument,
+  removeUserDocument,
+  checkAndMigrateExistingData,
   isFirebaseInitialized,
 } from '../lib/firebase';
 import { generateGeminiChatReply } from '../lib/geminiKeyRotator';
 
+const defaultMetaConfig: MetaConfig = {
+  app_id: '2300969844066002',
+  app_secret: 'a8f9210c48e8312019b882',
+  webhook_verify_token: 'Nazha125',
+  redirect_uri: `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'}/api/auth/instagram/callback`,
+};
+
 interface AppContextType {
   user: UserProfile;
+  firebaseUser: User | null;
+  authLoading: boolean;
+  logout: () => Promise<void>;
+  
   instagramAccount: InstagramAccount | null;
   automations: Automation[];
   contacts: Contact[];
@@ -47,8 +53,6 @@ interface AppContextType {
   setIsBuilderOpen: (open: boolean) => void;
   editingAutomation: Automation | null;
   setEditingAutomation: (auto: Automation | null) => void;
-  isSimulatorOpen: boolean;
-  setIsSimulatorOpen: (open: boolean) => void;
   isConnectModalOpen: boolean;
   setIsConnectModalOpen: (open: boolean) => void;
   isRenewModalOpen: boolean;
@@ -72,87 +76,223 @@ interface AppContextType {
 
   // Simulator & Webhook Engine
   simulateWebhookEvent: (triggerType: TriggerType, username: string, incomingText: string) => Promise<WebhookLogEvent>;
+  triggerWebhookSimulation: (params: { trigger_type: TriggerType; username: string; text: string }) => Promise<WebhookLogEvent>;
   
   // Inbox Actions
   sendManualReply: (fromUsername: string, text: string) => void;
   
+  // Deletion Actions (Permanent DB Removal)
+  deleteContact: (contactId: string, username?: string) => Promise<void>;
+  deleteContactsBulk: (contactIds: string[], usernames?: string[]) => Promise<void>;
+  deleteInboxThread: (username: string) => Promise<void>;
+  deleteInboxThreadsBulk: (usernames: string[]) => Promise<void>;
+
   // Channel & Config Actions
   updateMetaConfig: (config: Partial<MetaConfig>) => void;
   reauthorizeChannel: () => void;
-  disconnectChannel: () => void;
-  connectChannel: (username: string) => void;
+  disconnectChannel: () => Promise<void>;
+  connectChannel: (account: Partial<InstagramAccount> | string) => Promise<void>;
   renewPlan: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+const MOCK_HANDLES = ['sarah_creator', 'marcus.builds', 'elena_art', 'david_growth_hacks', 'chloe_agency', 'alexrivera.design'];
+
+const filterOutMockContacts = (items: Contact[]): Contact[] => {
+  return (items || []).filter(
+    (item) =>
+      item &&
+      (item.ig_username || item.ig_user_id) &&
+      !MOCK_HANDLES.includes((item.ig_username || '').toLowerCase())
+  );
+};
+
+const filterOutMockMessages = (items: InboxMessage[]): InboxMessage[] => {
+  return (items || []).filter(
+    (item) =>
+      item &&
+      (item.from_username || item.from_ig_id) &&
+      !MOCK_HANDLES.includes((item.from_username || '').toLowerCase())
+  );
+};
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Load initial state with localStorage fallback
-  const [user, setUser] = useState<UserProfile>(() => {
-    const saved = localStorage.getItem('autoreply_user') || localStorage.getItem('tezdm_user');
-    return saved ? JSON.parse(saved) : initialUser;
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(false);
+
+  const [user, setUser] = useState<UserProfile>({
+    id: 'primary_user',
+    name: 'Creator Admin',
+    email: 'admin@autoreply.io',
+    avatar_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80',
+    plan: 'pro',
+    trial_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    created_at: new Date().toISOString(),
   });
 
-  const [instagramAccount, setInstagramAccount] = useState<InstagramAccount | null>(() => {
-    const saved = localStorage.getItem('autoreply_ig_account') || localStorage.getItem('tezdm_ig_account');
-    return saved ? JSON.parse(saved) : initialInstagramAccount;
-  });
-
-  const [automations, setAutomations] = useState<Automation[]>(() => {
-    const saved = localStorage.getItem('autoreply_automations') || localStorage.getItem('tezdm_automations');
-    if (!saved) return initialAutomations;
-    try {
-      const parsed = JSON.parse(saved);
-      if (!parsed.some((a: Automation) => a.name === 'na' || a.id === 'auto_na')) {
-        return [initialAutomations[0], ...parsed];
-      }
-      return parsed;
-    } catch (e) {
-      return initialAutomations;
-    }
-  });
-
-  const [contacts, setContacts] = useState<Contact[]>(() => {
-    const saved = localStorage.getItem('autoreply_contacts') || localStorage.getItem('tezdm_contacts');
-    return saved ? JSON.parse(saved) : initialContacts;
-  });
-
-  const [inboxMessages, setInboxMessages] = useState<InboxMessage[]>(() => {
-    const saved = localStorage.getItem('autoreply_inbox') || localStorage.getItem('tezdm_inbox');
-    return saved ? JSON.parse(saved) : initialInboxMessages;
-  });
-
-  const [metaConfig, setMetaConfig] = useState<MetaConfig>(() => {
-    const saved = localStorage.getItem('autoreply_meta_config') || localStorage.getItem('tezdm_meta_config');
-    return saved ? JSON.parse(saved) : initialMetaConfig;
-  });
-
-  const [logs, setLogs] = useState<WebhookLogEvent[]>(() => {
-    const saved = localStorage.getItem('autoreply_logs') || localStorage.getItem('tezdm_logs');
-    return saved ? JSON.parse(saved) : initialLogs;
-  });
-
-  const [geminiKeys, setGeminiKeys] = useState<GeminiApiKeyItem[]>(() => {
-    const saved = localStorage.getItem('autoreply_gemini_keys') || localStorage.getItem('tezdm_gemini_keys');
-    return saved ? JSON.parse(saved) : initialGeminiKeys;
-  });
-
-  const [pausedAiUsers, setPausedAiUsers] = useState<string[]>(() => {
-    const saved = localStorage.getItem('autoreply_paused_ai_users') || localStorage.getItem('tezdm_paused_ai_users');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [instagramAccount, setInstagramAccount] = useState<InstagramAccount | null>(null);
+  const [automations, setAutomations] = useState<Automation[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [inboxMessages, setInboxMessages] = useState<InboxMessage[]>([]);
+  const [metaConfig, setMetaConfig] = useState<MetaConfig>(defaultMetaConfig);
+  const [logs, setLogs] = useState<WebhookLogEvent[]>([]);
+  const [geminiKeys, setGeminiKeys] = useState<GeminiApiKeyItem[]>([]);
+  const [pausedAiUsers, setPausedAiUsers] = useState<string[]>([]);
 
   const [activeTab, setActiveTab] = useState<'home' | 'automations' | 'contacts' | 'inbox' | 'settings'>('home');
   const [isBuilderOpen, setIsBuilderOpen] = useState<boolean>(false);
   const [editingAutomation, setEditingAutomation] = useState<Automation | null>(null);
-  const [isSimulatorOpen, setIsSimulatorOpen] = useState<boolean>(false);
   const [isConnectModalOpen, setIsConnectModalOpen] = useState<boolean>(false);
   const [isRenewModalOpen, setIsRenewModalOpen] = useState<boolean>(false);
 
+  // 1. Listen for Firebase Auth State Changes & Silent Background Init
   useEffect(() => {
-    localStorage.setItem('autoreply_paused_ai_users', JSON.stringify(pausedAiUsers));
-  }, [pausedAiUsers]);
+    if (!auth) {
+      setAuthLoading(false);
+      return;
+    }
 
+    const unsubscribe = onAuthStateChanged(auth, async (currUser) => {
+      setFirebaseUser(currUser);
+      if (currUser) {
+        const userProfile: UserProfile = {
+          id: currUser.uid,
+          name: currUser.displayName || currUser.email?.split('@')[0] || 'Creator Admin',
+          email: currUser.email || 'admin@autoreply.io',
+          avatar_url: currUser.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${currUser.uid}`,
+          plan: 'pro',
+          trial_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: currUser.metadata.creationTime || new Date().toISOString(),
+        };
+        setUser(userProfile);
+
+        // Run safe migration check if needed
+        try {
+          await checkAndMigrateExistingData(currUser.uid, currUser.email || '');
+        } catch (mErr) {
+          console.warn('[MIGRATION_CHECK_ERR]', mErr);
+        }
+      } else {
+        // Attempt silent background anonymous auth if available
+        try {
+          signInAnonymously(auth).catch(() => {
+            // If anonymous auth is disabled, fallback silently to primary_user
+          });
+        } catch {}
+      }
+      setAuthLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Multi-Tenant Firestore Synchronization (Scoped by active UID or fallback)
+  useEffect(() => {
+    if (!isFirebaseInitialized) {
+      return;
+    }
+
+    const uid = firebaseUser?.uid || 'primary_user';
+
+    const unsubscribeAutomations = subscribeToUserCollection<Automation>(uid, 'automations', (data) => {
+      if (data && data.length > 0) {
+        const sanitized: Automation[] = data.map((auto) => ({
+          ...auto,
+          id: auto.id || `auto_${Date.now()}`,
+          name: auto.name || 'Untitled Automation',
+          trigger_type: auto.trigger_type || 'dm',
+          trigger_config: {
+            all_or_keywords: auto.trigger_config?.all_or_keywords || 'keywords',
+            keywords: Array.isArray(auto.trigger_config?.keywords) ? auto.trigger_config.keywords : [],
+            smart_matching: auto.trigger_config?.smart_matching ?? true,
+            story_scope: auto.trigger_config?.story_scope || 'any_story',
+            post_scope: auto.trigger_config?.post_scope || 'any_post',
+            specific_post_url: auto.trigger_config?.specific_post_url || '',
+          },
+          actions: Array.isArray(auto.actions) ? auto.actions : [],
+          status: auto.status || 'active',
+          stats: {
+            runs: Number(auto.stats?.runs) || 0,
+            dms_sent: Number(auto.stats?.dms_sent) || 0,
+            unique_users: Number(auto.stats?.unique_users) || 0,
+            open_rate: typeof auto.stats?.open_rate === 'number' ? auto.stats.open_rate : 98,
+          },
+          created_at: auto.created_at || new Date().toISOString(),
+          updated_at: auto.updated_at || new Date().toISOString(),
+        }));
+        setAutomations(sanitized);
+      }
+    });
+
+    const unsubscribeContacts = subscribeToUserCollection<Contact>(uid, 'contacts', (data) => {
+      if (data) {
+        const sanitized: Contact[] = data.map((c) => ({
+          ...c,
+          id: c.id || `contact_${Date.now()}`,
+          ig_username: c.ig_username || c.ig_user_id || 'instagram_user',
+          ig_user_id: c.ig_user_id || '',
+          avatar_url: c.avatar_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${c.ig_username || 'user'}`,
+          first_interaction_at: c.first_interaction_at || new Date().toISOString(),
+          last_interaction_at: c.last_interaction_at || new Date().toISOString(),
+          interactions: {
+            comments: Number(c.interactions?.comments) || 0,
+            dms: Number(c.interactions?.dms) || 0,
+            stories: Number(c.interactions?.stories) || 0,
+          },
+          tags: Array.isArray(c.tags) ? c.tags : [],
+          status: c.status || 'converted',
+        }));
+        setContacts(filterOutMockContacts(sanitized));
+      }
+    });
+
+    const unsubscribeInbox = subscribeToUserCollection<InboxMessage>(uid, 'inbox_messages', (data) => {
+      if (data) {
+        const sanitized: InboxMessage[] = data.map((m) => ({
+          ...m,
+          id: m.id || `msg_${Date.now()}`,
+          from_ig_id: m.from_ig_id || '',
+          from_username: m.from_username || m.from_ig_id || 'instagram_user',
+          from_avatar: m.from_avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${m.from_username || 'user'}`,
+          message_text: m.message_text || '',
+          direction: m.direction || 'in',
+          timestamp: m.timestamp || new Date().toISOString(),
+        }));
+        const filtered = filterOutMockMessages(sanitized);
+        setInboxMessages(filtered.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+      }
+    });
+
+    const unsubscribeLogs = subscribeToUserCollection<WebhookLogEvent>(uid, 'webhook_logs', (data) => {
+      if (data) {
+        setLogs(data.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+      }
+    });
+
+    const unsubscribeKeys = subscribeToUserCollection<GeminiApiKeyItem>(uid, 'gemini_api_keys', (data) => {
+      if (data) {
+        setGeminiKeys(data);
+      }
+    });
+
+    const unsubscribeAccount = subscribeToUserCollection<InstagramAccount>(uid, 'instagram_account', (data) => {
+      if (data && data.length > 0) {
+        setInstagramAccount(data[0]);
+      }
+    });
+
+    return () => {
+      unsubscribeAutomations();
+      unsubscribeContacts();
+      unsubscribeInbox();
+      unsubscribeLogs();
+      unsubscribeKeys();
+      unsubscribeAccount();
+    };
+  }, [firebaseUser?.uid]);
+
+  // AI Human Takeover state
   const isAiPausedForUser = (username: string): boolean => {
     if (!username) return false;
     const clean = username.replace(/^@/, '').toLowerCase();
@@ -186,94 +326,79 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  // Sync state to local storage and Firestore
+  // 3. Handle OAuth callback parameters, window postMessage events, and initial account load
   useEffect(() => {
-    localStorage.setItem('autoreply_user', JSON.stringify(user));
-  }, [user]);
+    const uid = firebaseUser?.uid || 'primary_user';
 
-  useEffect(() => {
-    localStorage.setItem('autoreply_ig_account', JSON.stringify(instagramAccount));
-  }, [instagramAccount]);
+    // Fetch initial account state on mount or user change
+    fetch(`/api/instagram/account?userId=${encodeURIComponent(uid)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.account) {
+          const formatted = { ...data.account, id: 'primary' };
+          setInstagramAccount((prev) => prev || formatted);
+        }
+      })
+      .catch(console.warn);
 
-  useEffect(() => {
-    localStorage.setItem('autoreply_automations', JSON.stringify(automations));
-  }, [automations]);
+    const searchParams = new URLSearchParams(window.location.search);
+    const statusParam = searchParams.get('status');
 
-  useEffect(() => {
-    localStorage.setItem('autoreply_contacts', JSON.stringify(contacts));
-  }, [contacts]);
+    if (statusParam === 'ig_connected') {
+      fetch(`/api/instagram/account?userId=${encodeURIComponent(uid)}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data && data.account) {
+            const formatted = { ...data.account, id: 'primary' };
+            setInstagramAccount(formatted);
+            saveUserDocument(uid, 'instagram_account', formatted);
+          }
+        })
+        .catch(console.warn)
+        .finally(() => {
+          if (window.history && window.history.replaceState) {
+            const cleanUrl = window.location.pathname + (window.location.hash || '');
+            window.history.replaceState({}, document.title, cleanUrl);
+          }
+        });
+    }
 
-  useEffect(() => {
-    localStorage.setItem('autoreply_inbox', JSON.stringify(inboxMessages));
-  }, [inboxMessages]);
-
-  useEffect(() => {
-    localStorage.setItem('autoreply_meta_config', JSON.stringify(metaConfig));
-  }, [metaConfig]);
-
-  useEffect(() => {
-    localStorage.setItem('autoreply_logs', JSON.stringify(logs));
-  }, [logs]);
-
-  useEffect(() => {
-    localStorage.setItem('autoreply_gemini_keys', JSON.stringify(geminiKeys));
-  }, [geminiKeys]);
-
-  // Firestore real-time sync listeners
-  useEffect(() => {
-    if (!isFirebaseInitialized) return;
-
-    const unsubscribeAutomations = subscribeToCollection<Automation>('automations', (data) => {
-      if (data && data.length > 0) {
-        setAutomations(data);
-      } else {
-        saveMultipleDocuments('automations', initialAutomations);
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data === 'ig_connected' || event.data?.type === 'ig_connected') {
+        fetch(`/api/instagram/account?userId=${encodeURIComponent(uid)}`)
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && data.account) {
+              const formatted = { ...data.account, id: 'primary' };
+              setInstagramAccount(formatted);
+              saveUserDocument(uid, 'instagram_account', formatted);
+            }
+          })
+          .catch(console.warn);
       }
-    });
-
-    const unsubscribeContacts = subscribeToCollection<Contact>('contacts', (data) => {
-      if (data && data.length > 0) {
-        setContacts(data);
-      } else {
-        saveMultipleDocuments('contacts', initialContacts);
-      }
-    });
-
-    const unsubscribeInbox = subscribeToCollection<InboxMessage>('inbox_messages', (data) => {
-      if (data && data.length > 0) {
-        setInboxMessages(data.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-      } else {
-        saveMultipleDocuments('inbox_messages', initialInboxMessages);
-      }
-    });
-
-    const unsubscribeLogs = subscribeToCollection<WebhookLogEvent>('webhook_logs', (data) => {
-      if (data && data.length > 0) {
-        setLogs(data.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-      } else {
-        saveMultipleDocuments('webhook_logs', initialLogs);
-      }
-    });
-
-    const unsubscribeKeys = subscribeToCollection<GeminiApiKeyItem>('gemini_api_keys', (data) => {
-      if (data && data.length > 0) {
-        setGeminiKeys(data);
-      } else {
-        saveMultipleDocuments('gemini_api_keys', initialGeminiKeys);
-      }
-    });
-
-    return () => {
-      unsubscribeAutomations();
-      unsubscribeContacts();
-      unsubscribeInbox();
-      unsubscribeLogs();
-      unsubscribeKeys();
     };
-  }, []);
 
-  // Automation CRUD
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [firebaseUser?.uid]);
+
+  // Logout Handler
+  const logout = async () => {
+    if (auth) {
+      await signOut(auth);
+    }
+    setInstagramAccount(null);
+    setAutomations([]);
+    setContacts([]);
+    setInboxMessages([]);
+    setLogs([]);
+    setGeminiKeys([]);
+    setActiveTab('home');
+  };
+
+  // Automation CRUD (Scoped by UID)
   const createAutomation = (newAuto: Omit<Automation, 'id' | 'created_at' | 'updated_at' | 'stats'>) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     const created: Automation = {
       ...newAuto,
       id: `auto_${Date.now()}`,
@@ -287,15 +412,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       },
     };
     setAutomations((prev) => [created, ...prev]);
-    saveDocument('automations', created);
+    saveUserDocument(uid, 'automations', created);
   };
 
   const updateAutomation = (id: string, updates: Partial<Automation>) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     setAutomations((prev) =>
       prev.map((auto) => {
         if (auto.id === id) {
           const updated = { ...auto, ...updates, updated_at: new Date().toISOString() };
-          saveDocument('automations', updated);
+          saveUserDocument(uid, 'automations', updated);
           return updated;
         }
         return auto;
@@ -304,16 +430,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const deleteAutomation = (id: string) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     setAutomations((prev) => prev.filter((auto) => auto.id !== id));
-    removeDocument('automations', id);
+    removeUserDocument(uid, 'automations', id);
   };
 
   const toggleAutomationStatus = (id: string) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     setAutomations((prev) =>
       prev.map((auto) => {
         if (auto.id === id) {
           const updated = { ...auto, status: auto.status === 'active' ? ('paused' as const) : ('active' as const) };
-          saveDocument('automations', updated);
+          saveUserDocument(uid, 'automations', updated);
           return updated;
         }
         return auto;
@@ -321,10 +449,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
   };
 
-  // Gemini Key Management Actions
+  // Gemini Key Management Actions (Scoped by UID)
   const addGeminiKey = (key: string, label: string) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     const newKeyItem: GeminiApiKeyItem = {
-      id: `key_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      id: `key_${Date.now()}`,
       key: key.trim(),
       label: label.trim(),
       status: 'active',
@@ -334,20 +463,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       lastUsedAt: new Date().toISOString(),
     };
     setGeminiKeys((prev) => [newKeyItem, ...prev]);
-    saveDocument('gemini_api_keys', newKeyItem);
+    saveUserDocument(uid, 'gemini_api_keys', newKeyItem);
   };
 
   const deleteGeminiKey = (id: string) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     setGeminiKeys((prev) => prev.filter((k) => k.id !== id));
-    removeDocument('gemini_api_keys', id);
+    removeUserDocument(uid, 'gemini_api_keys', id);
   };
 
   const updateGeminiKey = (id: string, updates: Partial<GeminiApiKeyItem>) => {
+    const uid = firebaseUser?.uid || 'primary_user';
     setGeminiKeys((prev) =>
       prev.map((k) => {
         if (k.id === id) {
           const updated = { ...k, ...updates };
-          saveDocument('gemini_api_keys', updated);
+          saveUserDocument(uid, 'gemini_api_keys', updated);
           return updated;
         }
         return k;
@@ -355,13 +486,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
   };
 
-  // Simulator & Webhook Engine implementation with AI Chatbot support
+  // Simulator & Webhook Engine implementation
   const simulateWebhookEvent = async (triggerType: TriggerType, username: string, incomingText: string): Promise<WebhookLogEvent> => {
+    const uid = firebaseUser?.uid || 'guest';
     const cleanUser = username.replace(/^@/, '').toLowerCase();
     const upperText = incomingText.toUpperCase();
     const nowIso = new Date().toISOString();
 
-    // Check if AI conversion / auto-reply is paused for this user due to Human Interference or manual toggle
     if (isAiPausedForUser(cleanUser)) {
       const newInMsg: InboxMessage = {
         id: `msg_in_${Date.now()}`,
@@ -373,7 +504,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         timestamp: nowIso,
       };
       setInboxMessages((prev) => [newInMsg, ...prev]);
-      saveDocument('inbox_messages', newInMsg);
+      if (firebaseUser?.uid) saveUserDocument(firebaseUser.uid, 'inbox_messages', newInMsg);
 
       const logEntry: WebhookLogEvent = {
         id: `log_${Date.now()}`,
@@ -385,11 +516,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         response_sent: `AI Auto-Response stopped (Human Interference / Takeover Active for @${cleanUser}).`,
       };
       setLogs((prev) => [logEntry, ...prev]);
-      saveDocument('webhook_logs', logEntry);
+      if (firebaseUser?.uid) saveUserDocument(firebaseUser.uid, 'webhook_logs', logEntry);
       return logEntry;
     }
 
-    // Find matching active automation
     const matched = automations.find((auto) => {
       if (auto.status !== 'active') return false;
       if (auto.trigger_type !== triggerType) return false;
@@ -411,176 +541,118 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         response_sent: 'No active automation keywords matched.',
       };
       setLogs((prev) => [logEntry, ...prev]);
-      saveDocument('webhook_logs', logEntry);
+      if (firebaseUser?.uid) saveUserDocument(firebaseUser.uid, 'webhook_logs', logEntry);
       return logEntry;
     }
 
-    // Process matched automation actions
     let responseSummary = '';
     const aiAction = matched.actions.find((a) => a.type === 'ai_chatbot');
     const dmAction = matched.actions.find((a) => a.type === 'send_dm');
     const commentReplyAction = matched.actions.find((a) => a.type === 'reply_comment');
 
     if (aiAction) {
-      // 1. Fetch contact's previous chat history from Firestore / inboxMessages
-      const previousHistory = inboxMessages
-        .filter((m) => m.from_username.toLowerCase() === cleanUser)
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .slice(-10)
+      // Limit context history to last 2 messages for ultra-fast processing
+      const previousHistory = (inboxMessages || [])
+        .filter((m) => m?.from_username?.toLowerCase() === cleanUser)
+        .sort((a, b) => new Date(a?.timestamp || 0).getTime() - new Date(b?.timestamp || 0).getTime())
+        .slice(-2)
         .map((m) => ({
-          role: m.direction === 'in' ? ('user' as const) : ('model' as const),
-          text: m.message_text,
+          role: (m.direction === 'in' ? 'user' : 'model') as 'user' | 'model',
+          text: m.message_text || '',
         }));
 
-      // 2. Send history + incoming message to Gemini API with multi-key rotation fallback
-      let aiReplyText = 'Hello! Thanks for reaching out. How can I assist you today?';
-      let usedKeyLabel = 'Primary Key Pool';
-
       try {
-        const aiResult = await generateGeminiChatReply({
+        const aiResponse = await generateGeminiChatReply({
           history: previousHistory,
-          incomingText: incomingText,
-          systemInstruction: aiAction.ai_system_instruction,
-          model: aiAction.ai_model || 'gemini-3.6-flash',
-          keysPool: geminiKeys,
-          onKeyStatusChange: (updatedKeys) => {
-            setGeminiKeys(updatedKeys);
-            saveMultipleDocuments('gemini_api_keys', updatedKeys);
-          },
+          incomingText,
+          systemInstruction: aiAction.ai_system_instruction || 'You are a helpful and polite Instagram assistant. Reply directly in 1 short sentence.',
+          model: (aiAction.ai_model as any) || 'gemini-3.1-flash-lite',
+          maxOutputTokens: 60,
         });
-        aiReplyText = aiResult.reply;
-        usedKeyLabel = aiResult.usedKeyLabel;
-      } catch (err) {
-        console.error('Gemini AI Chatbot execution error:', err);
+        responseSummary = aiResponse.reply;
+      } catch (err: any) {
+        responseSummary = 'Thanks for your message! Our team will reach back out to you shortly.';
       }
-
-      responseSummary += `AI Chatbot (${usedKeyLabel}): "${aiReplyText.slice(0, 45)}..." `;
-
-      // 3. Save Gemini's reply & incoming message back to Firestore
-      const newInMsg: InboxMessage = {
-        id: `msg_in_${Date.now()}`,
-        from_ig_id: `ig_usr_${cleanUser}`,
-        from_username: cleanUser,
-        from_avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUser}`,
-        message_text: incomingText,
-        direction: 'in',
-        timestamp: nowIso,
-      };
-
-      const newOutMsg: InboxMessage = {
-        id: `msg_out_${Date.now()}`,
-        from_ig_id: instagramAccount?.ig_user_id || '17841405829124401',
-        from_username: instagramAccount?.username || 'alexrivera.design',
-        message_text: aiReplyText,
-        direction: 'out',
-        is_automated: true,
-        automation_id: matched.id,
-        timestamp: new Date(Date.now() + 800).toISOString(),
-      };
-
-      setInboxMessages((prev) => [newOutMsg, newInMsg, ...prev]);
-      saveDocument('inbox_messages', newInMsg);
-      saveDocument('inbox_messages', newOutMsg);
+    } else if (dmAction && dmAction.message_text) {
+      responseSummary = dmAction.message_text;
+    } else if (commentReplyAction && commentReplyAction.comment_reply_text) {
+      responseSummary = commentReplyAction.comment_reply_text;
+    } else {
+      responseSummary = 'Automation trigger acknowledged.';
     }
 
-    if (dmAction && dmAction.message_text) {
-      const formattedMessage = dmAction.message_text.replace('{first_name}', cleanUser);
-      responseSummary += `Sent DM: "${formattedMessage.slice(0, 45)}..." `;
+    const inMsg: InboxMessage = {
+      id: `msg_in_${Date.now()}`,
+      from_ig_id: `ig_usr_${cleanUser}`,
+      from_username: cleanUser,
+      from_avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUser}`,
+      message_text: incomingText,
+      direction: 'in',
+      timestamp: nowIso,
+    };
 
-      const newInMsg: InboxMessage = {
-        id: `msg_in_${Date.now()}`,
-        from_ig_id: `ig_usr_${cleanUser}`,
-        from_username: cleanUser,
-        from_avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUser}`,
-        message_text: incomingText,
-        direction: 'in',
-        timestamp: nowIso,
-      };
+    const outMsg: InboxMessage = {
+      id: `msg_out_${Date.now() + 1}`,
+      from_ig_id: `ig_usr_${cleanUser}`,
+      from_username: cleanUser,
+      from_avatar: instagramAccount?.profile_pic_url || 'https://api.dicebear.com/7.x/avataaars/svg?seed=autoreply',
+      message_text: responseSummary,
+      direction: 'out',
+      is_automated: true,
+      automation_id: matched.id,
+      timestamp: new Date(Date.now() + 1000).toISOString(),
+    };
 
-      const newOutMsg: InboxMessage = {
-        id: `msg_out_${Date.now()}`,
-        from_ig_id: instagramAccount?.ig_user_id || '17841405829124401',
-        from_username: instagramAccount?.username || 'alexrivera.design',
-        message_text: formattedMessage,
-        direction: 'out',
-        is_automated: true,
-        automation_id: matched.id,
-        timestamp: new Date(Date.now() + 1000).toISOString(),
-      };
+    const userUid = uid || firebaseUser?.uid || 'primary_user';
+    setInboxMessages((prev) => [outMsg, inMsg, ...prev]);
+    saveUserDocument(userUid, 'inbox_messages', inMsg);
+    saveUserDocument(userUid, 'inbox_messages', outMsg);
 
-      setInboxMessages((prev) => [newOutMsg, newInMsg, ...prev]);
-      saveDocument('inbox_messages', newInMsg);
-      saveDocument('inbox_messages', newOutMsg);
-    }
+    // Also trigger backend test-webhook endpoint asynchronously
+    fetch('/api/test-webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        trigger_type: triggerType,
+        username: cleanUser,
+        text: incomingText,
+        userId: userUid,
+      }),
+    }).catch((err) => console.warn('[TEST_WEBHOOK_CALL_WARN]', err));
 
-    if (commentReplyAction && commentReplyAction.comment_reply_text) {
-      responseSummary += `Comment Reply posted. `;
-    }
+    // Upsert Contact
+    const existingContact = contacts.find((c) => c.ig_username.toLowerCase() === cleanUser);
+    const updatedContact: Contact = {
+      id: existingContact ? existingContact.id : `cnt_${Date.now()}`,
+      ig_username: cleanUser,
+      ig_user_id: existingContact ? existingContact.ig_user_id : `ig_${Date.now()}`,
+      avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUser}`,
+      first_interaction_at: existingContact ? existingContact.first_interaction_at : nowIso,
+      last_interaction_at: nowIso,
+      interactions: {
+        comments: (existingContact?.interactions.comments || 0) + (triggerType === 'comment' ? 1 : 0),
+        dms: (existingContact?.interactions.dms || 0) + (triggerType === 'dm' ? 1 : 0),
+        stories: (existingContact?.interactions.stories || 0) + (triggerType === 'story_reply' ? 1 : 0),
+      },
+      status: 'converted',
+    };
 
-    // Update Automation stats
-    setAutomations((prev) =>
-      prev.map((a) => {
-        if (a.id === matched.id) {
-          const updated = {
-            ...a,
-            stats: {
-              ...a.stats,
-              runs: a.stats.runs + 1,
-              dms_sent: dmAction || aiAction ? a.stats.dms_sent + 1 : a.stats.dms_sent,
-              unique_users: a.stats.unique_users + 1,
-            },
-            updated_at: nowIso,
-          };
-          saveDocument('automations', updated);
-          return updated;
-        }
-        return a;
-      })
-    );
-
-    // Update Contacts list
     setContacts((prev) => {
-      const existing = prev.find((c) => c.ig_username.toLowerCase() === cleanUser);
-      if (existing) {
-        return prev.map((c) => {
-          if (c.ig_username.toLowerCase() === cleanUser) {
-            const updated = {
-              ...c,
-              last_interaction_at: nowIso,
-              interactions: {
-                ...c.interactions,
-                comments: triggerType === 'comment' ? c.interactions.comments + 1 : c.interactions.comments,
-                dms: triggerType === 'dm' ? c.interactions.dms + 1 : c.interactions.dms,
-                stories: triggerType === 'story_reply' ? c.interactions.stories + 1 : c.interactions.stories,
-              },
-            };
-            saveDocument('contacts', updated);
-            return updated;
-          }
-          return c;
-        });
-      } else {
-        const newContact: Contact = {
-          id: `cnt_${Date.now()}`,
-          ig_username: cleanUser,
-          ig_user_id: `ig_usr_${cleanUser}`,
-          avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUser}`,
-          first_interaction_at: nowIso,
-          last_interaction_at: nowIso,
-          interactions: {
-            comments: triggerType === 'comment' ? 1 : 0,
-            dms: triggerType === 'dm' ? 1 : 0,
-            stories: triggerType === 'story_reply' ? 1 : 0,
-          },
-          tags: [matched.name.slice(0, 15)],
-          status: 'lead',
-        };
-        saveDocument('contacts', newContact);
-        return [newContact, ...prev];
-      }
+      const filtered = prev.filter((c) => c.ig_username.toLowerCase() !== cleanUser);
+      return [updatedContact, ...filtered];
+    });
+    saveUserDocument(uid, 'contacts', updatedContact);
+
+    // Update Automation Stats
+    updateAutomation(matched.id, {
+      stats: {
+        ...matched.stats,
+        runs: (matched.stats?.runs || 0) + 1,
+        dms_sent: (matched.stats?.dms_sent || 0) + 1,
+      },
     });
 
-    const logEntry: WebhookLogEvent = {
+    const finalLog: WebhookLogEvent = {
       id: `log_${Date.now()}`,
       timestamp: nowIso,
       trigger_type: triggerType,
@@ -591,28 +663,183 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       response_sent: responseSummary,
     };
 
-    setLogs((prev) => [logEntry, ...prev]);
-    saveDocument('webhook_logs', logEntry);
-    return logEntry;
+    setLogs((prev) => [finalLog, ...prev]);
+    saveUserDocument(uid, 'webhook_logs', finalLog);
+
+    return finalLog;
   };
 
-  const sendManualReply = (fromUsername: string, text: string) => {
+  const triggerWebhookSimulation = async (params: {
+    trigger_type: TriggerType;
+    username: string;
+    text: string;
+  }): Promise<WebhookLogEvent> => {
+    return simulateWebhookEvent(params.trigger_type, params.username, params.text);
+  };
+
+  const sendManualReply = async (fromUsername: string, text: string) => {
+    if (!text.trim()) return;
     const cleanUser = fromUsername.replace(/^@/, '').toLowerCase();
     const nowIso = new Date().toISOString();
-    const newMsg: InboxMessage = {
-      id: `msg_manual_${Date.now()}`,
-      from_ig_id: instagramAccount?.ig_user_id || '17841405829124401',
-      from_username: instagramAccount?.username || 'alexrivera.design',
-      message_text: text,
+    const uid = firebaseUser?.uid || 'primary_user';
+
+    const newOutMsg: InboxMessage = {
+      id: `msg_out_${Date.now()}`,
+      from_ig_id: `ig_usr_${cleanUser}`,
+      from_username: cleanUser,
+      from_avatar: instagramAccount?.profile_pic_url || 'https://api.dicebear.com/7.x/avataaars/svg?seed=autoreply',
+      message_text: text.trim(),
       direction: 'out',
       is_automated: false,
       timestamp: nowIso,
     };
-    setInboxMessages((prev) => [newMsg, ...prev]);
-    saveDocument('inbox_messages', newMsg);
 
-    // Human Interference Detected: Automatically pause AI auto-reply for this user!
+    setInboxMessages((prev) => [newOutMsg, ...prev]);
+    saveUserDocument(uid, 'inbox_messages', newOutMsg);
+
+    // Auto pause AI for this contact since human intervened
     setAiPausedForUser(cleanUser, true);
+
+    // Dispatch live Instagram Graph API call to send message to recipient
+    try {
+      await fetch('/api/instagram/send-dm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipientUsername: cleanUser,
+          messageText: text.trim(),
+          userId: uid,
+        }),
+      });
+    } catch (err) {
+      console.warn('[SEND_MANUAL_DM_DISPATCH_WARN]', err);
+    }
+  };
+
+  // Contacts & Inbox Deletion (Scoped by UID)
+  const deleteContact = async (contactId: string, username?: string) => {
+    if (!contactId && !username) return;
+    const uid = firebaseUser?.uid || 'primary_user';
+
+    await removeUserDocument(uid, 'contacts', contactId);
+
+    const targetUsername = username || contacts.find((c) => c.id === contactId)?.ig_username;
+    if (targetUsername) {
+      const cleanTarget = targetUsername.toLowerCase();
+      const msgsToDelete = inboxMessages.filter(
+        (m) => m.from_username?.toLowerCase() === cleanTarget
+      );
+      for (const msg of msgsToDelete) {
+        await removeUserDocument(uid, 'inbox_messages', msg.id);
+      }
+      setInboxMessages((prev) =>
+        prev.filter((m) => m.from_username?.toLowerCase() !== cleanTarget)
+      );
+    }
+
+    setContacts((prev) => prev.filter((c) => c.id !== contactId));
+
+    try {
+      await fetch('/api/contacts/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contactId, username: targetUsername, userId: uid }),
+      });
+    } catch (e) {
+      console.warn('[DELETE_CONTACT_API_WARN]', e);
+    }
+  };
+
+  const deleteContactsBulk = async (contactIds: string[], usernames: string[] = []) => {
+    if (!contactIds || contactIds.length === 0) return;
+    const uid = firebaseUser?.uid || 'primary_user';
+
+    for (const cid of contactIds) {
+      await removeUserDocument(uid, 'contacts', cid);
+    }
+
+    const targetUsernames = new Set<string>(usernames.map((u) => u.toLowerCase()));
+    contacts.forEach((c) => {
+      if (contactIds.includes(c.id)) {
+        targetUsernames.add(c.ig_username.toLowerCase());
+      }
+    });
+
+    const msgsToDelete = inboxMessages.filter(
+      (m) => m.from_username && targetUsernames.has(m.from_username.toLowerCase())
+    );
+    for (const msg of msgsToDelete) {
+      await removeUserDocument(uid, 'inbox_messages', msg.id);
+    }
+
+    setContacts((prev) => prev.filter((c) => !contactIds.includes(c.id)));
+    setInboxMessages((prev) =>
+      prev.filter((m) => !m.from_username || !targetUsernames.has(m.from_username.toLowerCase()))
+    );
+
+    try {
+      await fetch('/api/contacts/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contactIds, usernames: Array.from(targetUsernames), userId: uid }),
+      });
+    } catch (e) {
+      console.warn('[DELETE_CONTACTS_BULK_API_WARN]', e);
+    }
+  };
+
+  const deleteInboxThread = async (username: string) => {
+    if (!username) return;
+    const uid = firebaseUser?.uid || 'primary_user';
+    const cleanUname = username.toLowerCase();
+
+    const msgsToDelete = inboxMessages.filter(
+      (m) => m.from_username?.toLowerCase() === cleanUname
+    );
+    for (const msg of msgsToDelete) {
+      await removeUserDocument(uid, 'inbox_messages', msg.id);
+    }
+
+    setInboxMessages((prev) =>
+      prev.filter((m) => m.from_username?.toLowerCase() !== cleanUname)
+    );
+
+    try {
+      await fetch('/api/inbox/delete-thread', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, userId: uid }),
+      });
+    } catch (e) {
+      console.warn('[DELETE_INBOX_THREAD_API_WARN]', e);
+    }
+  };
+
+  const deleteInboxThreadsBulk = async (usernames: string[]) => {
+    if (!usernames || usernames.length === 0) return;
+    const uid = firebaseUser?.uid || 'primary_user';
+    const targets = new Set(usernames.map((u) => u.toLowerCase()));
+
+    const msgsToDelete = inboxMessages.filter(
+      (m) => m.from_username && targets.has(m.from_username.toLowerCase())
+    );
+    for (const msg of msgsToDelete) {
+      await removeUserDocument(uid, 'inbox_messages', msg.id);
+    }
+
+    setInboxMessages((prev) =>
+      prev.filter((m) => !m.from_username || !targets.has(m.from_username.toLowerCase()))
+    );
+
+    try {
+      await fetch('/api/inbox/bulk-delete-threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usernames, userId: uid }),
+      });
+    } catch (e) {
+      console.warn('[DELETE_INBOX_BULK_API_WARN]', e);
+    }
   };
 
   const updateMetaConfig = (config: Partial<MetaConfig>) => {
@@ -620,33 +847,64 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const reauthorizeChannel = () => {
-    if (instagramAccount) {
-      setInstagramAccount({
-        ...instagramAccount,
-        token_expires_at: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString(),
-        status: 'connected',
+    setIsConnectModalOpen(true);
+  };
+
+  const disconnectChannel = async () => {
+    const uid = firebaseUser?.uid || 'primary_user';
+    await removeUserDocument(uid, 'instagram_account', 'primary');
+    if (instagramAccount?.id) {
+      await removeUserDocument(uid, 'instagram_account', instagramAccount.id);
+    }
+    setInstagramAccount(null);
+    try {
+      await fetch('/api/instagram/account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: null, userId: uid }),
       });
+    } catch (err) {
+      console.warn('[DISCONNECT_CHANNEL_ERR]', err);
     }
   };
 
-  const disconnectChannel = () => {
-    setInstagramAccount(null);
-  };
+  const connectChannel = async (accountInput: Partial<InstagramAccount> | string) => {
+    let cleanUsername = '';
+    let accountObj: Partial<InstagramAccount> = {};
+    if (typeof accountInput === 'string') {
+      cleanUsername = accountInput.replace(/^@/, '').trim();
+      accountObj = { username: cleanUsername };
+    } else {
+      cleanUsername = (accountInput.username || '').replace(/^@/, '').trim();
+      accountObj = accountInput;
+    }
+    if (!cleanUsername) return;
 
-  const connectChannel = (username: string) => {
-    const clean = username.replace(/^@/, '');
+    const uid = firebaseUser?.uid || 'primary_user';
     const newAccount: InstagramAccount = {
-      id: `ig_acc_${Date.now()}`,
-      ig_user_id: `17841${Math.floor(Math.random() * 1000000000)}`,
-      username: clean || 'brand.official',
-      profile_pic_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${clean}`,
-      followers_count: 12500,
-      access_token: 'EAAO8Z3...encrypted_token',
+      id: 'primary',
+      ig_user_id: accountObj.ig_user_id || `ig_user_${cleanUsername}`,
+      username: cleanUsername,
+      profile_pic_url: accountObj.profile_pic_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${cleanUsername}`,
+      followers_count: typeof accountObj.followers_count === 'number' ? accountObj.followers_count : 2480,
+      access_token: accountObj.access_token || '',
       token_expires_at: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString(),
       connected_at: new Date().toISOString(),
       status: 'connected',
     };
+
     setInstagramAccount(newAccount);
+    await saveUserDocument(uid, 'instagram_account', newAccount);
+
+    try {
+      await fetch('/api/instagram/account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: newAccount, userId: uid }),
+      });
+    } catch (err) {
+      console.warn('[CONNECT_CHANNEL_API_ERR]', err);
+    }
     setIsConnectModalOpen(false);
   };
 
@@ -663,6 +921,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     <AppContext.Provider
       value={{
         user,
+        firebaseUser,
+        authLoading,
+        logout,
         instagramAccount,
         automations,
         contacts,
@@ -677,8 +938,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setIsBuilderOpen,
         editingAutomation,
         setEditingAutomation,
-        isSimulatorOpen,
-        setIsSimulatorOpen,
         isConnectModalOpen,
         setIsConnectModalOpen,
         isRenewModalOpen,
@@ -694,7 +953,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         deleteGeminiKey,
         updateGeminiKey,
         simulateWebhookEvent,
+        triggerWebhookSimulation,
         sendManualReply,
+        deleteContact,
+        deleteContactsBulk,
+        deleteInboxThread,
+        deleteInboxThreadsBulk,
         updateMetaConfig,
         reauthorizeChannel,
         disconnectChannel,

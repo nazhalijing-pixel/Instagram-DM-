@@ -18,7 +18,7 @@ export interface InstagramAccount {
   username: string;
   profile_pic_url: string;
   followers_count: number;
-  access_token: string;
+  access_token?: string;
   token_expires_at: string;
   connected_at: string;
   status: 'connected' | 'expired' | 'action_required';
@@ -51,7 +51,7 @@ export interface ActionItem {
   comment_reply_text?: string;
   tag_name?: string;
   ai_system_instruction?: string;
-  ai_model?: 'gemini-3.6-flash' | 'gemini-3.1-flash-lite';
+  ai_model?: 'gemini-1.5-flash' | 'gemini-2.5-flash' | 'gemini-3.6-flash' | 'gemini-3.1-flash-lite' | string;
 }
 
 export interface Automation {
@@ -112,12 +112,34 @@ export interface MetaConfig {
 export interface WebhookLogEvent {
   id: string;
   timestamp: string;
-  trigger_type: TriggerType;
+  trigger_type: TriggerType | 'app_subscription';
   from_username: string;
   incoming_text: string;
-  status: 'triggered' | 'ignored' | 'error';
+  status: 'triggered' | 'ignored' | 'error' | 'success';
   matched_automation_name?: string;
   response_sent?: string;
+  webhook_received_at?: string;
+  webhook_received_at_ms?: number;
+  meta_event_timestamp?: number | string | null;
+  meta_transit_delay_ms?: number | null;
+  reply_api_call_start?: string;
+  reply_api_call_start_ms?: number;
+  reply_api_call_end?: string;
+  reply_api_call_end_ms?: number;
+  ig_api_duration_ms?: number;
+  total_processing_duration_ms?: number;
+  instance_uptime_seconds?: number;
+  instance_is_warm?: boolean;
+  timing_breakdown?: {
+    meta_transit_delay_ms?: number | null;
+    cache_lookup_duration_ms?: number;
+    rule_matching_duration_ms?: number;
+    reply_prep_duration_ms?: number;
+    ai_gen_duration_ms?: number;
+    ig_api_duration_ms?: number;
+    total_pipeline_duration_ms?: number;
+  };
+  api_response?: any;
 }
 
 export interface SystemStats {

@@ -13,31 +13,90 @@ import {
   X,
   ExternalLink,
   ShieldCheck,
+  Trash2,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Contact } from '../../types';
 
 export const ContactsPage: React.FC = () => {
-  const { contacts } = useApp();
+  const { contacts, deleteContact, deleteContactsBulk } = useApp();
   const [search, setSearch] = useState('');
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [activeContact, setActiveContact] = useState<Contact | null>(null);
 
-  // Collect unique tags
-  const allTags = Array.from(new Set(contacts.flatMap((c) => c.tags || [])));
+  // Checkbox Selection State for Bulk Operations
+  const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
 
-  const filteredContacts = contacts.filter((c) => {
-    const matchesSearch = c.ig_username.toLowerCase().includes(search.toLowerCase());
-    const matchesTag = !selectedTag || (c.tags && c.tags.includes(selectedTag));
+  // Collect unique tags
+  const allTags = Array.from(new Set((contacts || []).flatMap((c) => c?.tags || [])));
+
+  const filteredContacts = (contacts || []).filter((c) => {
+    if (!c) return false;
+    const uname = c.ig_username || c.ig_user_id || '';
+    const matchesSearch = uname.toLowerCase().includes(search.toLowerCase());
+    const matchesTag = !selectedTag || (Array.isArray(c.tags) && c.tags.includes(selectedTag));
     return matchesSearch && matchesTag;
   });
 
+  const isAllSelected =
+    filteredContacts.length > 0 &&
+    filteredContacts.every((c) => selectedContactIds.includes(c.id));
+
+  const toggleSelectAll = () => {
+    if (isAllSelected) {
+      setSelectedContactIds([]);
+    } else {
+      setSelectedContactIds(filteredContacts.map((c) => c.id));
+    }
+  };
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedContactIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  const handleRemoveSingle = async (contact: Contact) => {
+    const uname = contact.ig_username || contact.ig_user_id || 'user';
+    if (
+      window.confirm(
+        `Are you sure you want to permanently remove @${uname}? This will delete the contact and all associated chat history from the database.`
+      )
+    ) {
+      await deleteContact(contact.id, contact.ig_username);
+      setSelectedContactIds((prev) => prev.filter((id) => id !== contact.id));
+      if (activeContact?.id === contact.id) {
+        setActiveContact(null);
+      }
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedContactIds.length === 0) return;
+    const targetContacts = (contacts || []).filter((c) => selectedContactIds.includes(c.id));
+    const targetUsernames = targetContacts.map((c) => c.ig_username || c.ig_user_id || '');
+
+    if (
+      window.confirm(
+        `Are you sure you want to permanently remove ${selectedContactIds.length} selected contact(s) and their message histories from the database?`
+      )
+    ) {
+      await deleteContactsBulk(selectedContactIds, targetUsernames);
+      setSelectedContactIds([]);
+      if (activeContact && selectedContactIds.includes(activeContact.id)) {
+        setActiveContact(null);
+      }
+    }
+  };
+
   const exportCsv = () => {
     const headers = 'IG Username,First Interaction,Last Interaction,Comments,DMs,Stories,Status\n';
-    const rows = contacts
+    const rows = (contacts || [])
       .map(
         (c) =>
-          `@${c.ig_username},${c.first_interaction_at},${c.last_interaction_at},${c.interactions.comments},${c.interactions.dms},${c.interactions.stories},${c.status || 'lead'}`
+          `@${c.ig_username || c.ig_user_id || 'unknown'},${c.first_interaction_at || ''},${c.last_interaction_at || ''},${c.interactions?.comments || 0},${c.interactions?.dms || 0},${c.interactions?.stories || 0},${c.status || 'lead'}`
       )
       .join('\n');
 
@@ -50,27 +109,37 @@ export const ContactsPage: React.FC = () => {
   };
 
   return (
-    <div className="p-8 space-y-8 bg-[#F7F6FB] min-h-screen">
-      {/* Filter & Search Bar */}
-      <div className="bg-white rounded-2xl p-4 border border-slate-100 shadow-2xs flex flex-col md:flex-row items-center justify-between gap-4">
+    <div className="p-8 space-y-6 bg-[#F9F6FE] min-h-screen">
+      {/* Filter & Action Toolbar */}
+      <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">
         <div className="relative flex-1 w-full">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 stroke-[2.2]" />
           <input
             type="text"
-            placeholder="Search by Instagram username (e.g. sarah_creator)..."
+            placeholder="Search by Instagram username..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-[#3B5BFF] focus:outline-hidden"
+            className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs font-bold text-slate-900 placeholder:text-slate-500 focus:ring-2 focus:ring-[#3B5BFF] focus:outline-hidden"
           />
         </div>
 
-        {/* Tag Filters & Export Button */}
+        {/* Tag Filters & Bulk Delete & Export Button */}
         <div className="flex flex-wrap items-center gap-2 w-full md:w-auto justify-between md:justify-end">
+          {selectedContactIds.length > 0 && (
+            <button
+              onClick={handleBulkDelete}
+              className="bg-red-600 hover:bg-red-700 text-white font-black text-xs py-2 px-3.5 rounded-xl shadow-xs transition-all flex items-center gap-1.5 shrink-0 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete Selected ({selectedContactIds.length})</span>
+            </button>
+          )}
+
           <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={() => setSelectedTag(null)}
-              className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
-                selectedTag === null ? 'bg-[#3B5BFF] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              className={`px-3 py-1.5 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                selectedTag === null ? 'bg-[#3B5BFF] text-white shadow-xs' : 'bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-200'
               }`}
             >
               All Tags
@@ -79,8 +148,8 @@ export const ContactsPage: React.FC = () => {
               <button
                 key={tag}
                 onClick={() => setSelectedTag(tag === selectedTag ? null : tag)}
-                className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
-                  selectedTag === tag ? 'bg-[#3B5BFF] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                className={`px-3 py-1.5 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  selectedTag === tag ? 'bg-[#3B5BFF] text-white shadow-xs' : 'bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-200'
                 }`}
               >
                 {tag}
@@ -90,20 +159,33 @@ export const ContactsPage: React.FC = () => {
 
           <button
             onClick={exportCsv}
-            className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs py-2 px-3.5 rounded-xl shadow-xs transition-all flex items-center gap-2 shrink-0"
+            className="bg-slate-900 hover:bg-slate-800 text-white font-black text-xs py-2 px-3.5 rounded-xl btn-primary-elevated flex items-center gap-2 shrink-0 cursor-pointer"
           >
-            <Download className="w-4 h-4" />
+            <Download className="w-4 h-4 stroke-[2.2]" />
             <span>Export CSV</span>
           </button>
         </div>
       </div>
 
       {/* Contacts Table */}
-      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-2xs overflow-hidden">
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
-            <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase tracking-wider text-[10px]">
+            <thead className="bg-slate-100/90 border-b border-slate-200 text-slate-900 font-black uppercase tracking-wider text-[11px]">
               <tr>
+                <th className="p-4 w-10 text-center">
+                  <button
+                    onClick={toggleSelectAll}
+                    title="Select All"
+                    className="text-slate-600 hover:text-slate-900 cursor-pointer"
+                  >
+                    {isAllSelected ? (
+                      <CheckSquare className="w-4 h-4 text-[#3B5BFF]" />
+                    ) : (
+                      <Square className="w-4 h-4 stroke-[2.2]" />
+                    )}
+                  </button>
+                </th>
                 <th className="p-4">Instagram User</th>
                 <th className="p-4">Interactions Breakdown</th>
                 <th className="p-4">Tags</th>
@@ -112,90 +194,125 @@ export const ContactsPage: React.FC = () => {
                 <th className="p-4 text-right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody className="divide-y divide-slate-200">
               {filteredContacts.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="p-8 text-center text-slate-500">
-                    No contacts matched your search filter.
+                  <td colSpan={7} className="p-8 text-center text-slate-600 font-bold">
+                    No captured contacts found. Incoming Instagram interactions will automatically appear here.
                   </td>
                 </tr>
               ) : (
-                filteredContacts.map((contact) => (
-                  <tr key={contact.id} className="hover:bg-slate-50/80 transition-colors">
-                    {/* User Info */}
-                    <td className="p-4">
-                      <div className="flex items-center gap-3">
-                        <img
-                          src={
-                            contact.avatar_url ||
-                            `https://api.dicebear.com/7.x/avataaars/svg?seed=${contact.ig_username}`
-                          }
-                          alt={contact.ig_username}
-                          className="w-9 h-9 rounded-full object-cover border border-slate-200"
-                        />
-                        <div>
-                          <div className="font-bold text-slate-900">@{contact.ig_username}</div>
-                          <div className="text-[10px] text-slate-400 font-medium">ID: {contact.ig_user_id}</div>
-                        </div>
-                      </div>
-                    </td>
+                filteredContacts.map((contact) => {
+                  const isSelected = selectedContactIds.includes(contact.id);
+                  return (
+                    <tr
+                      key={contact.id}
+                      className={`hover:bg-slate-50 transition-colors ${
+                        isSelected ? 'bg-indigo-50/50' : ''
+                      }`}
+                    >
+                      {/* Select Checkbox */}
+                      <td className="p-4 text-center">
+                        <button
+                          onClick={() => toggleSelectOne(contact.id)}
+                          className="text-slate-500 hover:text-slate-800 cursor-pointer"
+                        >
+                          {isSelected ? (
+                            <CheckSquare className="w-4 h-4 text-[#3B5BFF]" />
+                          ) : (
+                            <Square className="w-4 h-4 stroke-[2.2]" />
+                          )}
+                        </button>
+                      </td>
 
-                    {/* Breakdown */}
-                    <td className="p-4">
-                      <div className="flex items-center gap-3">
-                        <div className="flex items-center gap-1 bg-purple-50 text-purple-700 px-2 py-0.5 rounded-md text-[11px] font-bold">
-                          <MessageSquare className="w-3 h-3" />
-                          <span>{contact.interactions.comments} comments</span>
+                      {/* User Info */}
+                      <td className="p-4">
+                        <div className="flex items-center gap-3">
+                          {contact.avatar_url ? (
+                            <img
+                              src={contact.avatar_url}
+                              alt={contact.ig_username}
+                              className="w-9 h-9 rounded-full object-cover border border-slate-300 shadow-2xs"
+                            />
+                          ) : (
+                            <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xs shadow-2xs">
+                              {contact.ig_username.charAt(0).toUpperCase()}
+                            </div>
+                          )}
+                          <div>
+                            <div className="font-black text-slate-950">@{contact.ig_username}</div>
+                            <div className="text-[10px] text-slate-500 font-bold">ID: {contact.ig_user_id}</div>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-1 bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md text-[11px] font-bold">
-                          <MessageCircle className="w-3 h-3" />
-                          <span>{contact.interactions.dms} DMs</span>
-                        </div>
-                        <div className="flex items-center gap-1 bg-amber-50 text-amber-700 px-2 py-0.5 rounded-md text-[11px] font-bold">
-                          <Instagram className="w-3 h-3" />
-                          <span>{contact.interactions.stories} stories</span>
-                        </div>
-                      </div>
-                    </td>
+                      </td>
 
-                    {/* Tags */}
-                    <td className="p-4">
-                      <div className="flex flex-wrap gap-1">
-                        {contact.tags?.map((t, idx) => (
-                          <span
-                            key={idx}
-                            className="bg-slate-100 text-slate-700 font-semibold px-2 py-0.5 rounded text-[10px]"
+                      {/* Breakdown */}
+                      <td className="p-4">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <div className="flex items-center gap-1 bg-purple-100 text-purple-900 border border-purple-200 px-2 py-0.5 rounded-md text-[11px] font-black">
+                            <MessageSquare className="w-3 h-3 stroke-[2.2]" />
+                            <span>{contact.interactions?.comments || 0} comments</span>
+                          </div>
+                          <div className="flex items-center gap-1 bg-blue-100 text-blue-900 border border-blue-200 px-2 py-0.5 rounded-md text-[11px] font-black">
+                            <MessageCircle className="w-3 h-3 stroke-[2.2]" />
+                            <span>{contact.interactions?.dms || 0} DMs</span>
+                          </div>
+                          <div className="flex items-center gap-1 bg-amber-100 text-amber-900 border border-amber-200 px-2 py-0.5 rounded-md text-[11px] font-black">
+                            <Instagram className="w-3 h-3 stroke-[2.2]" />
+                            <span>{contact.interactions?.stories || 0} stories</span>
+                          </div>
+                        </div>
+                      </td>
+
+                      {/* Tags */}
+                      <td className="p-4">
+                        <div className="flex flex-wrap gap-1">
+                          {contact.tags?.map((t, idx) => (
+                            <span
+                              key={idx}
+                              className="bg-slate-200 text-slate-900 border border-slate-300 font-bold px-2 py-0.5 rounded text-[10px]"
+                            >
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+
+                      {/* First Captured */}
+                      <td className="p-4 text-slate-800 font-bold text-[11px]">
+                        {new Date(contact.first_interaction_at).toLocaleDateString()}
+                      </td>
+
+                      {/* Last Active */}
+                      <td className="p-4 text-slate-800 font-bold text-[11px]">
+                        {new Date(contact.last_interaction_at).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </td>
+
+                      {/* Actions */}
+                      <td className="p-4 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => setActiveContact(contact)}
+                            className="bg-indigo-50 hover:bg-indigo-100 text-[#3B5BFF] font-bold text-[11px] px-3 py-1.5 rounded-lg border border-indigo-200 transition-colors cursor-pointer"
                           >
-                            {t}
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-
-                    {/* First Captured */}
-                    <td className="p-4 text-slate-600 font-medium text-[11px]">
-                      {new Date(contact.first_interaction_at).toLocaleDateString()}
-                    </td>
-
-                    {/* Last Active */}
-                    <td className="p-4 text-slate-600 font-medium text-[11px]">
-                      {new Date(contact.last_interaction_at).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                    </td>
-
-                    {/* Actions */}
-                    <td className="p-4 text-right">
-                      <button
-                        onClick={() => setActiveContact(contact)}
-                        className="bg-indigo-50 hover:bg-indigo-100 text-[#3B5BFF] font-bold text-[11px] px-3 py-1.5 rounded-lg border border-indigo-200 transition-colors"
-                      >
-                        View History
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                            View History
+                          </button>
+                          <button
+                            onClick={() => handleRemoveSingle(contact)}
+                            title="Remove contact from database permanently"
+                            className="bg-red-50 hover:bg-red-100 text-red-600 font-bold text-[11px] px-2.5 py-1.5 rounded-lg border border-red-200 transition-colors flex items-center gap-1 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Remove</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -211,23 +328,26 @@ export const ContactsPage: React.FC = () => {
                 <h3 className="font-bold text-slate-900 text-base">Contact Profile</h3>
                 <button
                   onClick={() => setActiveContact(null)}
-                  className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100"
+                  className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 cursor-pointer"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
               <div className="text-center mb-6">
-                <img
-                  src={
-                    activeContact.avatar_url ||
-                    `https://api.dicebear.com/7.x/avataaars/svg?seed=${activeContact.ig_username}`
-                  }
-                  alt={activeContact.ig_username}
-                  className="w-16 h-16 rounded-full object-cover border-2 border-slate-200 mx-auto mb-2 shadow-sm"
-                />
+                {activeContact.avatar_url ? (
+                  <img
+                    src={activeContact.avatar_url}
+                    alt={activeContact.ig_username}
+                    className="w-16 h-16 rounded-full object-cover border-2 border-slate-200 mx-auto mb-2 shadow-sm"
+                  />
+                ) : (
+                  <div className="w-16 h-16 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xl mx-auto mb-2 shadow-sm">
+                    {activeContact.ig_username.charAt(0).toUpperCase()}
+                  </div>
+                )}
                 <h4 className="font-extrabold text-slate-900 text-lg">@{activeContact.ig_username}</h4>
-                <p className="text-xs text-slate-500">Instagram User • Captured via Reel DM</p>
+                <p className="text-xs text-slate-500">Instagram User • Captured Contact</p>
               </div>
 
               <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3 mb-6">
@@ -249,12 +369,21 @@ export const ContactsPage: React.FC = () => {
               </div>
             </div>
 
-            <button
-              onClick={() => setActiveContact(null)}
-              className="w-full bg-slate-900 text-white font-bold py-2.5 rounded-xl text-xs"
-            >
-              Close Profile
-            </button>
+            <div className="space-y-2">
+              <button
+                onClick={() => handleRemoveSingle(activeContact)}
+                className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer shadow-xs transition-all"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>Remove Contact Permanently</span>
+              </button>
+              <button
+                onClick={() => setActiveContact(null)}
+                className="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold py-2 rounded-xl text-xs cursor-pointer transition-all"
+              >
+                Close Profile
+              </button>
+            </div>
           </div>
         </div>
       )}
