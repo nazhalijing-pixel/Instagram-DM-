@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Contact } from '../../types';
+import { UserAvatar } from '../Common/UserAvatar';
 
 export const ContactsPage: React.FC = () => {
   const { contacts, deleteContact, deleteContactsBulk } = useApp();
@@ -34,8 +35,18 @@ export const ContactsPage: React.FC = () => {
 
   const filteredContacts = (contacts || []).filter((c) => {
     if (!c) return false;
-    const uname = c.ig_username || c.ig_user_id || '';
-    const matchesSearch = uname.toLowerCase().includes(search.toLowerCase());
+    if (c.is_test === true) return false;
+    const uname = (c.ig_username || c.ig_user_id || '').toLowerCase();
+    if (
+      uname.includes('940977') ||
+      uname.startsWith('user_940977') ||
+      uname === 'webhook_test_user' ||
+      uname.startsWith('user_') ||
+      uname.includes('test_user')
+    ) {
+      return false;
+    }
+    const matchesSearch = uname.includes(search.toLowerCase());
     const matchesTag = !selectedTag || (Array.isArray(c.tags) && c.tags.includes(selectedTag));
     return matchesSearch && matchesTag;
   });
@@ -228,17 +239,11 @@ export const ContactsPage: React.FC = () => {
                       {/* User Info */}
                       <td className="p-4">
                         <div className="flex items-center gap-3">
-                          {contact.avatar_url ? (
-                            <img
-                              src={contact.avatar_url}
-                              alt={contact.ig_username}
-                              className="w-9 h-9 rounded-full object-cover border border-slate-300 shadow-2xs"
-                            />
-                          ) : (
-                            <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xs shadow-2xs">
-                              {contact.ig_username.charAt(0).toUpperCase()}
-                            </div>
-                          )}
+                          <UserAvatar
+                            src={contact.avatar_url}
+                            username={contact.ig_username}
+                            size="md"
+                          />
                           <div>
                             <div className="font-black text-slate-950">@{contact.ig_username}</div>
                             <div className="text-[10px] text-slate-500 font-bold">ID: {contact.ig_user_id}</div>
@@ -335,17 +340,13 @@ export const ContactsPage: React.FC = () => {
               </div>
 
               <div className="text-center mb-6">
-                {activeContact.avatar_url ? (
-                  <img
+                <div className="flex justify-center mb-2">
+                  <UserAvatar
                     src={activeContact.avatar_url}
-                    alt={activeContact.ig_username}
-                    className="w-16 h-16 rounded-full object-cover border-2 border-slate-200 mx-auto mb-2 shadow-sm"
+                    username={activeContact.ig_username}
+                    size="2xl"
                   />
-                ) : (
-                  <div className="w-16 h-16 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xl mx-auto mb-2 shadow-sm">
-                    {activeContact.ig_username.charAt(0).toUpperCase()}
-                  </div>
-                )}
+                </div>
                 <h4 className="font-extrabold text-slate-900 text-lg">@{activeContact.ig_username}</h4>
                 <p className="text-xs text-slate-500">Instagram User • Captured Contact</p>
               </div>

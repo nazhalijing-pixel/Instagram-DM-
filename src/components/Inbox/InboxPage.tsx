@@ -17,6 +17,7 @@ import {
   Play,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { UserAvatar } from '../Common/UserAvatar';
 
 export const InboxPage: React.FC = () => {
   const {
@@ -47,10 +48,26 @@ export const InboxPage: React.FC = () => {
 
   const myUsername = (instagramAccount?.username || '').toLowerCase();
 
+  const isTestOrMockHandle = (uname: string): boolean => {
+    if (!uname) return true;
+    const lower = uname.toLowerCase().trim();
+    if (
+      lower.includes('940977') ||
+      lower.startsWith('user_940977') ||
+      lower === 'webhook_test_user' ||
+      lower.startsWith('user_') ||
+      lower.includes('test_user')
+    ) {
+      return true;
+    }
+    return false;
+  };
+
   // Group messages by target contact username (and include all contacts)
   const groupedUsers = Array.from(
     new Set<string>([
       ...(inboxMessages || [])
+        .filter((m) => !m?.is_test && !isTestOrMockHandle(m?.from_username || m?.from_ig_id || ''))
         .map((m) => m?.from_username || m?.from_ig_id || '')
         .filter(
           (uname): uname is string =>
@@ -59,6 +76,7 @@ export const InboxPage: React.FC = () => {
             (!myUsername || uname.toLowerCase() !== myUsername)
         ),
       ...(contacts || [])
+        .filter((c) => !c?.is_test && !isTestOrMockHandle(c?.ig_username || c?.ig_user_id || ''))
         .map((c) => c?.ig_username || c?.ig_user_id || '')
         .filter(
           (uname): uname is string =>
@@ -78,6 +96,7 @@ export const InboxPage: React.FC = () => {
   // Active conversation thread sorted chronologically
   const currentThread = selectedUser
     ? (inboxMessages || [])
+        .filter((m) => !m?.is_test)
         .filter(
           (m) =>
             (m?.from_username && m.from_username.toLowerCase() === selectedUser.toLowerCase()) ||
@@ -88,21 +107,25 @@ export const InboxPage: React.FC = () => {
 
   const isCurrentAiPaused = selectedUser ? isAiPausedForUser(selectedUser) : false;
 
-  const getContactAvatar = (uname: string) => {
-    if (!uname) return `https://api.dicebear.com/7.x/avataaars/svg?seed=user`;
+  const getContactAvatar = (uname: string): string | null => {
+    if (!uname) return null;
+    const clean = uname.trim().replace(/^@/, '').toLowerCase();
     const contact = (contacts || []).find(
       (c) =>
-        (c?.ig_username && c.ig_username.toLowerCase() === uname.toLowerCase()) ||
-        (c?.ig_user_id && c.ig_user_id.toLowerCase() === uname.toLowerCase())
+        (c?.ig_username && c.ig_username.trim().replace(/^@/, '').toLowerCase() === clean) ||
+        (c?.ig_user_id && c.ig_user_id.toLowerCase() === clean)
     );
-    if (contact?.avatar_url) return contact.avatar_url;
+    if (contact?.avatar_url && !contact.avatar_url.includes('api.dicebear.com')) {
+      return contact.avatar_url;
+    }
     const msgWithAvatar = (inboxMessages || []).find(
       (m) =>
-        (((m?.from_username && m.from_username.toLowerCase() === uname.toLowerCase()) ||
-          (m?.from_ig_id && m.from_ig_id.toLowerCase() === uname.toLowerCase()))) &&
-        m.from_avatar
+        (((m?.from_username && m.from_username.trim().replace(/^@/, '').toLowerCase() === clean) ||
+          (m?.from_ig_id && m.from_ig_id.toLowerCase() === clean))) &&
+        m.from_avatar &&
+        !m.from_avatar.includes('api.dicebear.com')
     );
-    return msgWithAvatar?.from_avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(uname)}`;
+    return msgWithAvatar?.from_avatar || null;
   };
 
   const handleSend = (e: React.FormEvent) => {
@@ -298,27 +321,12 @@ export const InboxPage: React.FC = () => {
                         )}
                       </button>
 
-                      <div className="relative shrink-0">
-                        {avatar ? (
-                          <img
-                            src={avatar}
-                            alt={username}
-                            className="w-9 h-9 rounded-full border border-slate-200 object-cover"
-                          />
-                        ) : (
-                          <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xs shadow-2xs">
-                            {username.charAt(0).toUpperCase()}
-                          </div>
-                        )}
-                        {isUserAiPaused && (
-                          <span
-                            title="Human Takeover Active"
-                            className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-amber-500 border-2 border-white flex items-center justify-center text-[9px] text-white font-black"
-                          >
-                            👤
-                          </span>
-                        )}
-                      </div>
+                      <UserAvatar
+                        src={avatar}
+                        username={username}
+                        size="md"
+                        isAiPaused={isUserAiPaused}
+                      />
 
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5">
@@ -427,17 +435,12 @@ export const InboxPage: React.FC = () => {
               {/* Thread Header */}
               <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
-                  {getContactAvatar(selectedUser) ? (
-                    <img
-                      src={getContactAvatar(selectedUser)}
-                      alt={selectedUser}
-                      className="w-9 h-9 rounded-full border border-slate-200 object-cover"
-                    />
-                  ) : (
-                    <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xs shadow-2xs">
-                      {selectedUser.charAt(0).toUpperCase()}
-                    </div>
-                  )}
+                  <UserAvatar
+                    src={getContactAvatar(selectedUser)}
+                    username={selectedUser}
+                    size="md"
+                    isAiPaused={isCurrentAiPaused}
+                  />
                   <div>
                     <h4 className="font-bold text-sm text-slate-900 flex items-center gap-2">
                       <span>@{selectedUser}</span>

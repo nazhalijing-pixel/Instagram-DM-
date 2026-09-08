@@ -14,6 +14,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { UserAvatar } from './UserAvatar';
 
 export const ConnectChannelModal: React.FC = () => {
   const {
@@ -22,6 +23,8 @@ export const ConnectChannelModal: React.FC = () => {
     instagramAccount,
     connectChannel,
     disconnectChannel,
+    firebaseUser,
+    user,
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'quick' | 'token' | 'oauth'>('quick');
@@ -101,7 +104,8 @@ export const ConnectChannelModal: React.FC = () => {
   };
 
   const handleOAuthLaunch = () => {
-    const popupUrl = '/api/auth/instagram';
+    const uid = firebaseUser?.uid || user?.id || '';
+    const popupUrl = `/api/auth/instagram?userId=${encodeURIComponent(uid)}`;
     const width = 600;
     const height = 700;
     const left = window.screenX + (window.outerWidth - width) / 2;
@@ -150,10 +154,11 @@ export const ConnectChannelModal: React.FC = () => {
         {instagramAccount && (
           <div className="mb-5 p-3.5 bg-emerald-50/80 rounded-2xl border border-emerald-200 flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
-              <img
+              <UserAvatar
                 src={instagramAccount.profile_pic_url}
-                alt={instagramAccount.username}
-                className="w-10 h-10 rounded-full object-cover border-2 border-white shadow-xs shrink-0"
+                username={instagramAccount.username}
+                showInstagramBadge={true}
+                size="md"
               />
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5">

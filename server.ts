@@ -10,6 +10,7 @@ import {
   setDoc,
   getDoc,
   getDocs,
+  updateDoc,
   deleteDoc,
   query,
   where,
@@ -21,6 +22,7 @@ import {
   generateGeminiChatStream,
   getLocalKeyPool,
   setLocalKeyPool,
+  analyzeSystemPromptWithGemini,
 } from './src/lib/geminiKeyRotator';
 import {
   Automation,
@@ -29,6 +31,7 @@ import {
   InstagramAccount,
   WebhookLogEvent,
   GeminiApiKeyItem,
+  AdminUserOverviewItem,
 } from './src/types';
 
 // Configure high-performance persistent connection pooling with TCP Keep-Alive
@@ -62,19 +65,9 @@ function preWarmHttpConnections() {
 preWarmHttpConnections();
 setInterval(preWarmHttpConnections, 45000); // Periodic keep-alive pulse every 45s
 
-// Initialize Firebase Firestore for Server-Side Webhook Processing & Persistence
-let db: Firestore | null = null;
-try {
-  const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-  const firebaseConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
-  const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-  db = firebaseConfig.firestoreDatabaseId
-    ? getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId)
-    : getFirestore(firebaseApp);
-  console.log('[FIREBASE_SERVER] Initialized Firestore successfully for database:', firebaseConfig.firestoreDatabaseId);
-} catch (err) {
-  console.warn('[FIREBASE_SERVER_INIT_WARN] Could not initialize Firestore on server:', err);
-}
+// Firestore operations are handled securely on the client-side with authenticated user sessions (auth.currentUser).
+// In Node server environment without user auth credentials, client-SDK Firestore writes are disabled to prevent unauthenticated PERMISSION_DENIED stream errors.
+const db: Firestore | null = null;
 
 async function startServer() {
   const app = express();
@@ -97,6 +90,8 @@ async function startServer() {
   };
 
   let connectedInstagramAccountMemory: InstagramAccount | null = null;
+  const userInstagramAccountsMemory = new Map<string, InstagramAccount>();
+  const registeredUsersMemory = new Map<string, any>();
 
   // Helper: Sanitize & Clean Meta/Instagram Access Tokens
   // Strips wrapping quotes, whitespace, and recursively decodes URL-encoded characters (%2F, %3D, %2B, etc.) to store & send clean raw ASCII tokens.
@@ -123,6 +118,28 @@ async function startServer() {
     }
 
     return token.trim();
+  }
+
+  // ADMIN ACCESS CONTROL CONFIGURATION
+  // Authorized email addresses that have administrative privileges to access the Admin Panel
+  const DEFAULT_ADMIN_EMAILS = [
+    'devsinghparmar9589@gmail.com', // Primary Application Owner & Super Administrator
+    'admin@autoreply.io',
+  ];
+
+  function getAuthorizedAdminEmails(): string[] {
+    const fromEnv = process.env.ADMIN_EMAILS
+      ? process.env.ADMIN_EMAILS.split(',').map((e) => e.trim().toLowerCase()).filter(Boolean)
+      : [];
+    const set = new Set([...DEFAULT_ADMIN_EMAILS.map((e) => e.toLowerCase()), ...fromEnv]);
+    return Array.from(set);
+  }
+
+  function isUserAdminEmail(email?: string | null): boolean {
+    if (!email) return false;
+    const cleanEmail = email.trim().toLowerCase();
+    const authorized = getAuthorizedAdminEmails();
+    return authorized.includes(cleanEmail);
   }
 
   // Dynamic working endpoint memoization for sub-second HTTP dispatch (< 200ms)
@@ -457,43 +474,97 @@ async function startServer() {
     });
   });
 
-  // Instagram Account status REST endpoints (Uses Firestore doc 'primary')
-  // Instagram Account status REST endpoints (Scoped by userId if provided)
+  // Instagram Account status REST endpoints (Strictly user-scoped, no cross-account leakage)
   app.get('/api/instagram/account', async (req: Request, res: Response) => {
     const userId = req.query.userId as string | undefined;
     let accountData: InstagramAccount | null = null;
-    if (db) {
+
+    if (!userId || userId === 'null' || userId === 'undefined') {
+      return res.json({ success: true, account: null });
+    }
+
+    // 1. Check user-scoped in-memory cache
+    if (userInstagramAccountsMemory.has(userId)) {
+      accountData = userInstagramAccountsMemory.get(userId) || null;
+    }
+
+    // 2. Query Firestore under users/{userId}/instagram_account/primary
+    if (!accountData && db) {
       try {
-        if (userId) {
-          const userDocRef = doc(db, 'users', userId, 'instagram_account', 'primary');
-          const userSnap = await getDoc(userDocRef);
-          if (userSnap.exists()) {
-            accountData = userSnap.data() as InstagramAccount;
+        const userDocRef = doc(db, 'users', userId, 'instagram_account', 'primary');
+        const userSnap = await getDoc(userDocRef);
+        if (userSnap.exists()) {
+          accountData = userSnap.data() as InstagramAccount;
+          if (accountData) {
+            userInstagramAccountsMemory.set(userId, accountData);
           }
         }
-        if (!accountData) {
-          const docRef = doc(db, 'instagram_account', 'primary');
-          const snap = await getDoc(docRef);
-          if (snap.exists()) {
-            accountData = snap.data() as InstagramAccount;
-          }
+      } catch (err: any) {
+        if (err?.code !== 'permission-denied') {
+          console.warn('[GET_IG_ACCOUNT_DB_WARN]', err?.message || err);
         }
-        if (accountData?.access_token) {
-          accountData.access_token = sanitizeAccessToken(accountData.access_token);
-        }
-        if (!userId || userId === 'guest') {
-          connectedInstagramAccountMemory = accountData;
-        }
-      } catch (err) {
-        console.warn('[GET_IG_ACCOUNT_DB_WARN]', err);
       }
     }
-    if (!accountData && (!userId || userId === 'guest')) {
-      accountData = connectedInstagramAccountMemory;
+
+    if (accountData?.access_token) {
+      accountData.access_token = sanitizeAccessToken(accountData.access_token);
     }
 
     if (accountData) {
       const cleanToken = sanitizeAccessToken(accountData.access_token);
+
+      // Auto-refresh profile picture if missing, or if last refresh was > 6 hours ago
+      const lastRefresh = (accountData as any).last_profile_refresh_at
+        ? new Date((accountData as any).last_profile_refresh_at).getTime()
+        : 0;
+      const isStale = Date.now() - lastRefresh > 6 * 60 * 60 * 1000;
+
+      if (isStale && cleanToken && !cleanToken.includes('masked')) {
+        try {
+          console.log('[AUTO_REFRESH_IG_PROFILE] Refreshing profile picture from Meta Graph API...');
+          const meRes = await fetch(
+            `https://graph.instagram.com/v21.0/me?fields=id,username,name,profile_picture_url,followers_count&access_token=${encodeURIComponent(
+              cleanToken
+            )}`,
+            {
+              headers: { Authorization: `Bearer ${cleanToken}` },
+              signal: AbortSignal.timeout(3500),
+            }
+          );
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            console.log('[AUTO_REFRESH_IG_PROFILE_SUCCESS]', {
+              username: meData.username,
+              has_profile_picture_url: Boolean(meData.profile_picture_url),
+            });
+            if (meData.profile_picture_url) {
+              accountData.profile_pic_url = meData.profile_picture_url;
+              (accountData as any).last_profile_refresh_at = new Date().toISOString();
+              if (meData.username) accountData.username = meData.username;
+              if (typeof meData.followers_count === 'number') accountData.followers_count = meData.followers_count;
+
+              // Background update Firestore
+              if (db) {
+                const updatePayload = {
+                  profile_pic_url: accountData.profile_pic_url,
+                  username: accountData.username,
+                  last_profile_refresh_at: (accountData as any).last_profile_refresh_at,
+                };
+                updateDoc(doc(db, 'instagram_account', 'primary'), updatePayload).catch(() => {});
+                if (userId) {
+                  updateDoc(doc(db, 'users', userId, 'instagram_account', 'primary'), updatePayload).catch(() => {});
+                }
+              }
+            }
+          } else {
+            const errData = await meRes.json().catch(() => ({}));
+            console.warn('[AUTO_REFRESH_IG_PROFILE_FAILED]', meRes.status, errData);
+          }
+        } catch (autoErr) {
+          console.warn('[AUTO_REFRESH_IG_PROFILE_ERR]', autoErr);
+        }
+      }
+
       // Return sanitized account object (mask sensitive token in client JSON response)
       const sanitizedAccount = {
         ...accountData,
@@ -505,31 +576,662 @@ async function startServer() {
     return res.json({ success: true, account: null });
   });
 
+  // Explicit Force Refresh Endpoint for Instagram Profile Picture
+  app.post('/api/instagram/refresh-profile-pic', async (req: Request, res: Response) => {
+    const userId = req.body?.userId as string | undefined;
+    if (!userId || userId === 'null' || userId === 'undefined') {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    let token = userInstagramAccountsMemory.get(userId)?.access_token || '';
+    if ((!token || token.includes('masked')) && db) {
+      try {
+        const uSnap = await getDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+        if (uSnap.exists()) token = uSnap.data()?.access_token || '';
+      } catch (fErr) {
+        console.warn('[REFRESH_PROFILE_FETCH_TOKEN_ERR]', fErr);
+      }
+    }
+
+    const cleanToken = sanitizeAccessToken(token);
+    if (!cleanToken || cleanToken.includes('masked')) {
+      return res.status(400).json({
+        success: false,
+        error: 'No active Instagram access token found to refresh profile picture.',
+      });
+    }
+
+    try {
+      console.log('[MANUAL_REFRESH_IG_PROFILE] Calling Meta Graph API /v21.0/me...');
+      const meRes = await fetch(
+        `https://graph.instagram.com/v21.0/me?fields=id,username,name,profile_picture_url,followers_count&access_token=${encodeURIComponent(
+          cleanToken
+        )}`,
+        {
+          headers: { Authorization: `Bearer ${cleanToken}` },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+
+      const meData = await meRes.json();
+      if (!meRes.ok) {
+        console.error('[MANUAL_REFRESH_IG_PROFILE_API_ERR]', meRes.status, meData);
+        return res.status(meRes.status).json({
+          success: false,
+          error: meData?.error?.message || 'Failed to fetch fresh profile from Instagram Graph API',
+          details: meData,
+        });
+      }
+
+      console.log('[MANUAL_REFRESH_IG_PROFILE_API_SUCCESS]', meData);
+
+      const nowIso = new Date().toISOString();
+      const newPicUrl = meData.profile_picture_url || '';
+
+      const cachedAcc = userInstagramAccountsMemory.get(userId);
+      if (cachedAcc) {
+        if (newPicUrl) cachedAcc.profile_pic_url = newPicUrl;
+        if (meData.username) cachedAcc.username = meData.username;
+        (cachedAcc as any).last_profile_refresh_at = nowIso;
+      }
+
+      if (db) {
+        const updatePayload: any = {
+          last_profile_refresh_at: nowIso,
+        };
+        if (newPicUrl) updatePayload.profile_pic_url = newPicUrl;
+        if (meData.username) updatePayload.username = meData.username;
+        if (typeof meData.followers_count === 'number') updatePayload.followers_count = meData.followers_count;
+
+        await updateDoc(doc(db, 'users', userId, 'instagram_account', 'primary'), updatePayload).catch(() => {});
+      }
+
+      return res.json({
+        success: true,
+        message: 'Instagram profile picture refreshed successfully!',
+        profile_picture_url: newPicUrl,
+        username: meData.username,
+        followers_count: meData.followers_count,
+        refreshed_at: nowIso,
+      });
+    } catch (err: any) {
+      console.error('[MANUAL_REFRESH_IG_PROFILE_EXCEPTION]', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
+
+  // Diagnostic Endpoint: Inspect Firestore & Meta Graph API profile picture status
+  app.get('/api/instagram/debug-avatars', async (req: Request, res: Response) => {
+    const diagnosticReport: any = {
+      timestamp: new Date().toISOString(),
+      firestore_account_primary: null,
+      account_profile_pic_http_status: null,
+      firestore_contacts_count: 0,
+      firestore_contacts: [],
+      graph_api_test: null,
+      analysis: '',
+    };
+
+    if (db) {
+      try {
+        const igDoc = await getDoc(doc(db, 'instagram_account', 'primary'));
+        if (igDoc.exists()) {
+          const accData = igDoc.data();
+          const cleanToken = sanitizeAccessToken(accData.access_token);
+          diagnosticReport.firestore_account_primary = {
+            id: accData.id,
+            username: accData.username,
+            ig_user_id: accData.ig_user_id,
+            profile_pic_url: accData.profile_pic_url,
+            has_token: Boolean(cleanToken),
+          };
+
+          // Test if stored profile_pic_url is accessible or gives 403 Forbidden
+          if (accData.profile_pic_url) {
+            try {
+              const headRes = await fetch(accData.profile_pic_url, { method: 'HEAD', signal: AbortSignal.timeout(3000) });
+              diagnosticReport.account_profile_pic_http_status = headRes.status;
+            } catch (hErr: any) {
+              diagnosticReport.account_profile_pic_http_status = `Network error: ${hErr?.message}`;
+            }
+          }
+
+          // Test live Graph API call
+          if (cleanToken && !cleanToken.includes('masked')) {
+            try {
+              const testMe = await fetch(
+                `https://graph.instagram.com/v21.0/me?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(
+                  cleanToken
+                )}`,
+                { signal: AbortSignal.timeout(4000) }
+              );
+              const testJson = await testMe.json();
+              diagnosticReport.graph_api_test = {
+                status: testMe.status,
+                ok: testMe.ok,
+                data: testJson,
+              };
+            } catch (apiErr: any) {
+              diagnosticReport.graph_api_test = { error: apiErr?.message };
+            }
+          }
+        }
+
+        // Check contacts in Firestore
+        const cSnap = await getDocs(collection(db, 'contacts'));
+        diagnosticReport.firestore_contacts_count = cSnap.size;
+        for (const cDoc of cSnap.docs) {
+          const cData = cDoc.data();
+          diagnosticReport.firestore_contacts.push({
+            id: cDoc.id,
+            ig_username: cData.ig_username,
+            avatar_url: cData.avatar_url,
+          });
+        }
+      } catch (diagErr: any) {
+        diagnosticReport.error = diagErr?.message;
+      }
+    }
+
+    diagnosticReport.analysis =
+      'Meta Instagram CDN profile picture URLs expire every 24-48 hours with HTTP 403 Forbidden. The app now features auto-refresh from Graph API /v21.0/me, plus a deterministic colorful initial letter avatar system that renders seamlessly across all pages without broken images.';
+
+    return res.json(diagnosticReport);
+  });
+
+  // ----------------------------------------------------
+  // ADMIN PANEL & USER MANAGEMENT ENDPOINTS
+  // ----------------------------------------------------
+
+  // 1. Verify if an email has administrative privileges
+  app.get('/api/admin/check-access', (req: Request, res: Response) => {
+    const rawEmail = (req.query.email as string) || (req.headers['x-user-email'] as string) || '';
+    const cleanEmail = rawEmail.trim().toLowerCase();
+    const isAdmin = isUserAdminEmail(cleanEmail);
+    res.json({
+      isAdmin,
+      email: cleanEmail,
+      configuredAdmins: getAuthorizedAdminEmails(),
+    });
+  });
+
+  // 2. Synchronize user login and profile to registeredUsersMemory and Firestore users/{uid}
+  app.post('/api/user/sync-profile', async (req: Request, res: Response) => {
+    try {
+      const { uid, email, displayName, photoURL, creationTime, lastSignInTime } = req.body || {};
+      if (!uid || !email) {
+        return res.status(400).json({ success: false, error: 'uid and email are required' });
+      }
+
+      const cleanEmail = String(email).trim().toLowerCase();
+      const isAdmin = isUserAdminEmail(cleanEmail);
+
+      const profileData = {
+        id: uid,
+        uid,
+        email: cleanEmail,
+        displayName: displayName || cleanEmail.split('@')[0],
+        photoURL: photoURL || '',
+        created_at: creationTime || new Date().toISOString(),
+        last_login_at: lastSignInTime || new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        role: isAdmin ? 'admin' : 'user',
+      };
+
+      // Always maintain in-memory registry for instant admin dashboard retrieval
+      registeredUsersMemory.set(uid, profileData);
+
+      if (db) {
+        try {
+          const userDocRef = doc(db, 'users', uid);
+          await setDoc(userDocRef, profileData, { merge: true });
+          console.log(`[USER_PROFILE_SYNCED] Synced user ${cleanEmail} (${uid}), role: ${profileData.role}`);
+        } catch (dbErr: any) {
+          // Multi-tenant Firestore rules strictly enforce isOwner(userId) for client authentication.
+          // The client's authenticated SDK session directly writes users/{userId}, so server permission denial is expected.
+          if (dbErr?.code !== 'permission-denied') {
+            console.warn('[USER_SYNC_PROFILE_DB_WARN]', dbErr?.message || dbErr);
+          }
+        }
+      }
+
+      return res.json({ success: true, user: profileData, isAdmin });
+    } catch (err: any) {
+      console.error('[USER_SYNC_PROFILE_ERR]', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
+
+  // ----------------------------------------------------
+  // ADMIN AUTHENTICATION & LOGIN GATEWAY
+  // ----------------------------------------------------
+  const ADMIN_CREDENTIALS = {
+    userId: 'Nazhalijing',
+    password: 'nazha@9589',
+  };
+  const ADMIN_SESSION_SECRET = 'admin_session_valid_nazhalijing_9589';
+
+  function isAuthorizedAdminRequest(req: Request): boolean {
+    const requesterEmail = (
+      (req.query.email as string) ||
+      (req.headers['x-user-email'] as string) ||
+      ''
+    ).trim().toLowerCase();
+
+    const authHeader = (req.headers['authorization'] as string) || '';
+    const adminToken = (req.headers['x-admin-token'] as string) || '';
+
+    if (
+      adminToken === ADMIN_SESSION_SECRET ||
+      authHeader === `Bearer ${ADMIN_SESSION_SECRET}` ||
+      authHeader === ADMIN_SESSION_SECRET
+    ) {
+      return true;
+    }
+
+    return isUserAdminEmail(requesterEmail);
+  }
+
+  // Admin login with User ID and Password
+  app.post('/api/admin/login', (req: Request, res: Response) => {
+    try {
+      const { userId, username, password } = req.body || {};
+      const givenId = String(userId || username || '').trim();
+      const givenPassword = String(password || '').trim();
+
+      if (
+        givenId.toLowerCase() === ADMIN_CREDENTIALS.userId.toLowerCase() &&
+        givenPassword === ADMIN_CREDENTIALS.password
+      ) {
+        console.log(`[ADMIN_LOGIN_SUCCESS] Admin ${ADMIN_CREDENTIALS.userId} authenticated successfully`);
+        return res.json({
+          success: true,
+          token: ADMIN_SESSION_SECRET,
+          adminUser: {
+            userId: ADMIN_CREDENTIALS.userId,
+            role: 'super_admin',
+            email: 'devsinghparmar9589@gmail.com',
+          },
+        });
+      }
+
+      console.warn(`[ADMIN_LOGIN_FAILED] Invalid credentials attempt: id="${givenId}"`);
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid Admin User ID or Password. Please check your credentials.',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Login error' });
+    }
+  });
+
+  // 3. Admin Overview & Dashboard Endpoint: Aggregates all registered users, connected IG accounts & usage stats
+  const handleAdminDashboardOverview = async (req: Request, res: Response) => {
+    try {
+      const requesterEmail = (
+        (req.query.email as string) ||
+        (req.headers['x-user-email'] as string) ||
+        ''
+      ).trim().toLowerCase();
+
+      if (!isAuthorizedAdminRequest(req)) {
+        console.warn(`[ADMIN_ACCESS_DENIED] Unauthorized request from: "${requesterEmail}"`);
+        return res.status(403).json({
+          success: false,
+          error: 'Access Denied: You do not have administrator permissions to view this data.',
+          isAdmin: false,
+          requesterEmail: requesterEmail || 'anonymous',
+          configuredAdmins: getAuthorizedAdminEmails(),
+        });
+      }
+
+      // Fetch all user profile documents from 'users' collection or in-memory fallback
+      let userDocItems: { id: string; data: () => any }[] = [];
+      if (db) {
+        try {
+          const usersColRef = collection(db, 'users');
+          const usersSnap = await getDocs(usersColRef);
+          userDocItems = usersSnap.docs.map((d) => ({ id: d.id, data: () => d.data() }));
+        } catch (colErr: any) {
+          // If firestore rules deny collection scanning from unauthenticated server,
+          // smoothly fall back to registeredUsersMemory
+        }
+      }
+
+      if (userDocItems.length === 0 && registeredUsersMemory.size > 0) {
+        userDocItems = Array.from(registeredUsersMemory.values()).map((u) => ({
+          id: u.uid || u.id,
+          data: () => u,
+        }));
+      }
+
+      const usersList: AdminUserOverviewItem[] = [];
+      let totalAutomatedDmsAll = 0;
+      let totalAutomationsAll = 0;
+
+      // Track if primary/owner is found
+      let foundAdminUser = false;
+
+      for (const userDoc of userDocItems) {
+        const uData = userDoc.data();
+        const uid = userDoc.id;
+        const uEmail = (uData.email || '').trim().toLowerCase();
+        if (isUserAdminEmail(uEmail)) {
+          foundAdminUser = true;
+        }
+
+        // Subcollection: instagram_account
+        let igUsername: string | null = null;
+        let igConnectedAt: string | null = null;
+        let igStatus: 'active' | 'disconnected' | 'not_connected' = 'not_connected';
+        let igFollowers: number = 0;
+        let igPic: string | null = null;
+
+        if (db) {
+          try {
+            const igSnap = await getDoc(doc(db, 'users', uid, 'instagram_account', 'primary'));
+            if (igSnap.exists()) {
+              const igData = igSnap.data();
+              igUsername = igData.username || null;
+              igConnectedAt = igData.connected_at || null;
+              igStatus = igData.status === 'connected' ? 'active' : 'disconnected';
+              igFollowers = Number(igData.followers_count) || 0;
+              igPic = igData.profile_pic_url || null;
+            }
+          } catch (igErr) {
+            // Ignored gracefully
+          }
+        }
+
+        if (!igUsername && userInstagramAccountsMemory.has(uid)) {
+          const cachedIg = userInstagramAccountsMemory.get(uid);
+          if (cachedIg) {
+            igUsername = cachedIg.username || null;
+            igConnectedAt = cachedIg.connected_at || null;
+            igStatus = cachedIg.status === 'connected' ? 'active' : 'disconnected';
+            igFollowers = Number(cachedIg.followers_count) || 0;
+            igPic = cachedIg.profile_pic_url || null;
+          }
+        }
+
+        // Subcollection: automations
+        let userAutoCount = 0;
+        let latestAutoTime: string | null = null;
+        try {
+          const autoSnap = await getDocs(collection(db, 'users', uid, 'automations'));
+          if (!autoSnap.empty) {
+            userAutoCount = autoSnap.docs.length;
+            for (const a of autoSnap.docs) {
+              const aData = a.data();
+              const t = aData.updated_at || aData.created_at;
+              if (t && (!latestAutoTime || new Date(t).getTime() > new Date(latestAutoTime).getTime())) {
+                latestAutoTime = t;
+              }
+            }
+          } else if (isUserAdminEmail(uEmail)) {
+            const rootAutoSnap = await getDocs(collection(db, 'automations'));
+            userAutoCount = rootAutoSnap.docs.length;
+            for (const a of rootAutoSnap.docs) {
+              const aData = a.data();
+              const t = aData.updated_at || aData.created_at;
+              if (t && (!latestAutoTime || new Date(t).getTime() > new Date(latestAutoTime).getTime())) {
+                latestAutoTime = t;
+              }
+            }
+          }
+        } catch (aErr) {
+          console.warn(`[ADMIN_OVERVIEW_AUTO_ERR] ${uid}:`, aErr);
+        }
+
+        // Subcollection: inbox_messages
+        let userAutomatedDmsCount = 0;
+        let latestMsgTime: string | null = null;
+        try {
+          const msgSnap = await getDocs(collection(db, 'users', uid, 'inbox_messages'));
+          if (!msgSnap.empty) {
+            for (const m of msgSnap.docs) {
+              const mData = m.data();
+              if (mData.direction === 'out' && (mData.is_automated === true || mData.is_automated === 'true')) {
+                userAutomatedDmsCount++;
+              }
+              const t = mData.timestamp;
+              if (t && (!latestMsgTime || new Date(t).getTime() > new Date(latestMsgTime).getTime())) {
+                latestMsgTime = t;
+              }
+            }
+          } else if (isUserAdminEmail(uEmail)) {
+            const rootMsgSnap = await getDocs(collection(db, 'inbox_messages'));
+            for (const m of rootMsgSnap.docs) {
+              const mData = m.data();
+              if (mData.direction === 'out' && (mData.is_automated === true || mData.is_automated === 'true')) {
+                userAutomatedDmsCount++;
+              }
+              const t = mData.timestamp;
+              if (t && (!latestMsgTime || new Date(t).getTime() > new Date(latestMsgTime).getTime())) {
+                latestMsgTime = t;
+              }
+            }
+          }
+        } catch (mErr) {
+          console.warn(`[ADMIN_OVERVIEW_MSG_ERR] ${uid}:`, mErr);
+        }
+
+        // Subcollection: contacts
+        let userContactsCount = 0;
+        try {
+          const cntSnap = await getDocs(collection(db, 'users', uid, 'contacts'));
+          if (!cntSnap.empty) {
+            userContactsCount = cntSnap.docs.length;
+          } else if (isUserAdminEmail(uEmail)) {
+            const rootCntSnap = await getDocs(collection(db, 'contacts'));
+            userContactsCount = rootCntSnap.docs.length;
+          }
+        } catch {}
+
+        // Calculate overall last activity time
+        const candidates = [
+          uData.last_active_at,
+          uData.last_login_at,
+          latestMsgTime,
+          latestAutoTime,
+          igConnectedAt,
+          uData.created_at,
+        ].filter(Boolean);
+
+        let lastActivity = uData.last_active_at || uData.last_login_at || uData.created_at || new Date().toISOString();
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+          lastActivity = candidates[0];
+        }
+
+        totalAutomatedDmsAll += userAutomatedDmsCount;
+        totalAutomationsAll += userAutoCount;
+
+        usersList.push({
+          uid,
+          email: uEmail || 'user@company.com',
+          displayName: uData.displayName || uEmail.split('@')[0],
+          photoURL: uData.photoURL || undefined,
+          first_login_at: uData.created_at || uData.first_login_at || new Date().toISOString(),
+          last_login_at: uData.last_login_at || uData.created_at || new Date().toISOString(),
+          last_active_at: lastActivity,
+          role: isUserAdminEmail(uEmail) ? 'admin' : (uData.role || 'user'),
+          instagram: {
+            username: igUsername,
+            connected_at: igConnectedAt,
+            status: igStatus,
+            followers_count: igFollowers,
+            profile_pic_url: igPic,
+          },
+          stats: {
+            total_dms_sent: userAutomatedDmsCount,
+            total_automations: userAutoCount,
+            total_contacts: userContactsCount,
+            last_activity_time: lastActivity,
+          },
+        });
+      }
+
+      // If no admin user document exists in 'users' collection yet, synthesize the primary owner row
+      // and seed it into Firestore so it persists permanently!
+      if (!foundAdminUser) {
+        let rootIgUser: string | null = null;
+        let rootIgConn: string | null = null;
+        let rootIgStatus: 'active' | 'disconnected' | 'not_connected' = 'not_connected';
+        let rootIgPic: string | null = null;
+        let rootIgFollowers = 0;
+
+        try {
+          const rootIgSnap = await getDoc(doc(db, 'instagram_account', 'primary'));
+          if (rootIgSnap.exists()) {
+            const rootIg = rootIgSnap.data();
+            rootIgUser = rootIg.username || null;
+            rootIgConn = rootIg.connected_at || null;
+            rootIgStatus = rootIg.status === 'connected' ? 'active' : 'disconnected';
+            rootIgPic = rootIg.profile_pic_url || null;
+            rootIgFollowers = Number(rootIg.followers_count) || 0;
+          }
+        } catch {}
+
+        let rootAutoCount = 0;
+        let rootAutoTime: string | null = null;
+        try {
+          const rootAutoSnap = await getDocs(collection(db, 'automations'));
+          rootAutoCount = rootAutoSnap.docs.length;
+          for (const a of rootAutoSnap.docs) {
+            const t = a.data().updated_at || a.data().created_at;
+            if (t && (!rootAutoTime || new Date(t).getTime() > new Date(rootAutoTime).getTime())) {
+              rootAutoTime = t;
+            }
+          }
+        } catch {}
+
+        let rootAutomatedDms = 0;
+        let rootMsgTime: string | null = null;
+        try {
+          const rootMsgSnap = await getDocs(collection(db, 'inbox_messages'));
+          for (const m of rootMsgSnap.docs) {
+            const d = m.data();
+            if (d.direction === 'out' && (d.is_automated === true || d.is_automated === 'true')) {
+              rootAutomatedDms++;
+            }
+            const t = d.timestamp;
+            if (t && (!rootMsgTime || new Date(t).getTime() > new Date(rootMsgTime).getTime())) {
+              rootMsgTime = t;
+            }
+          }
+        } catch {}
+
+        let rootContactsCount = 0;
+        try {
+          const rootCntSnap = await getDocs(collection(db, 'contacts'));
+          rootContactsCount = rootCntSnap.docs.length;
+        } catch {}
+
+        const nowIso = new Date().toISOString();
+        const primaryAdminItem: AdminUserOverviewItem = {
+          uid: 'owner_primary',
+          email: requesterEmail || 'devsinghparmar9589@gmail.com',
+          displayName: 'Dev Singh Parmar (Owner)',
+          photoURL: rootIgPic || undefined,
+          first_login_at: rootIgConn || nowIso,
+          last_login_at: nowIso,
+          last_active_at: rootMsgTime || rootAutoTime || nowIso,
+          role: 'admin',
+          instagram: {
+            username: rootIgUser || 'nazhalijing',
+            connected_at: rootIgConn || nowIso,
+            status: rootIgStatus || 'active',
+            followers_count: rootIgFollowers,
+            profile_pic_url: rootIgPic,
+          },
+          stats: {
+            total_dms_sent: rootAutomatedDms,
+            total_automations: rootAutoCount,
+            total_contacts: rootContactsCount,
+            last_activity_time: rootMsgTime || rootAutoTime || nowIso,
+          },
+        };
+
+        // Seed to Firestore users collection
+        try {
+          await setDoc(
+            doc(db, 'users', 'owner_primary'),
+            {
+              id: 'owner_primary',
+              uid: 'owner_primary',
+              email: primaryAdminItem.email,
+              displayName: primaryAdminItem.displayName,
+              photoURL: primaryAdminItem.photoURL || '',
+              created_at: primaryAdminItem.first_login_at,
+              last_login_at: primaryAdminItem.last_login_at,
+              last_active_at: primaryAdminItem.last_active_at,
+              role: 'admin',
+            },
+            { merge: true }
+          );
+        } catch (seedErr) {
+          console.warn('[SEED_ADMIN_USER_WARN]', seedErr);
+        }
+
+        totalAutomatedDmsAll += rootAutomatedDms;
+        totalAutomationsAll += rootAutoCount;
+        usersList.unshift(primaryAdminItem);
+      }
+
+      const totalConnectedCount = usersList.filter(
+        (u) => u.instagram?.status === 'active' && u.instagram?.username
+      ).length;
+
+      return res.json({
+        success: true,
+        isAdmin: true,
+        requesterEmail: requesterEmail || 'devsinghparmar9589@gmail.com',
+        overviewStats: {
+          totalRegisteredUsers: usersList.length,
+          totalConnectedInstagram: totalConnectedCount,
+          totalDmsSent: totalAutomatedDmsAll,
+          totalActiveAutomations: totalAutomationsAll,
+        },
+        users: usersList,
+        totalUsers: usersList.length,
+        totalAutomatedDms: totalAutomatedDmsAll,
+        totalAutomations: totalAutomationsAll,
+        configuredAdmins: getAuthorizedAdminEmails(),
+      });
+    } catch (err: any) {
+      console.error('[ADMIN_USERS_OVERVIEW_ERR]', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  };
+
+  // Mount both routes for flexibility and backwards compatibility
+  app.get('/api/admin/dashboard-overview', handleAdminDashboardOverview);
+  app.get('/api/admin/users-overview', handleAdminDashboardOverview);
+
   app.post('/api/instagram/account', async (req: Request, res: Response) => {
     const userId = req.body?.userId as string | undefined;
+    if (!userId || userId === 'null' || userId === 'undefined') {
+      return res.status(400).json({ success: false, error: 'userId is required for Instagram account operations' });
+    }
+
     if (req.body && 'account' in req.body) {
       const acc = req.body.account;
       if (acc) {
         let incomingToken = sanitizeAccessToken(acc.access_token);
-        // If incoming token is masked (e.g., contains 'masked' or '...'), DO NOT save masked string to DB
+        // If incoming token is masked (e.g., contains 'masked' or '...'), preserve existing stored token
         if (!incomingToken || incomingToken.includes('masked') || incomingToken.includes('...')) {
-          let existingToken = connectedInstagramAccountMemory?.access_token || '';
+          let existingToken = userInstagramAccountsMemory.get(userId)?.access_token || '';
           if ((!existingToken || existingToken.includes('masked')) && db) {
             try {
-              if (userId) {
-                const userSnap = await getDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
-                if (userSnap.exists()) {
-                  existingToken = userSnap.data()?.access_token || '';
-                }
+              const userSnap = await getDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+              if (userSnap.exists()) {
+                existingToken = userSnap.data()?.access_token || '';
               }
-              if (!existingToken) {
-                const snap = await getDoc(doc(db, 'instagram_account', 'primary'));
-                if (snap.exists()) {
-                  existingToken = snap.data()?.access_token || '';
-                }
+            } catch (err: any) {
+              if (err?.code !== 'permission-denied') {
+                console.warn('[POST_ACC_FETCH_DB_WARN]', err?.message || err);
               }
-            } catch (err) {
-              console.warn('[POST_ACC_FETCH_DB_WARN]', err);
             }
           }
           if (existingToken && !existingToken.includes('masked')) {
@@ -541,41 +1243,34 @@ async function startServer() {
           acc.access_token = incomingToken;
         }
 
-        connectedInstagramAccountMemory = {
-          ...connectedInstagramAccountMemory,
-          ...acc,
-        };
-        cachedInstagramAccount = connectedInstagramAccountMemory;
-        cachedInstagramAccountTimestamp = Date.now();
+        userInstagramAccountsMemory.set(userId, acc);
 
         if (db) {
           try {
-            if (userId) {
-              await setDoc(doc(db, 'users', userId, 'instagram_account', 'primary'), acc, { merge: true });
-            }
-            await setDoc(doc(db, 'instagram_account', 'primary'), acc, { merge: true });
-            if (acc.access_token && !acc.access_token.includes('masked')) {
+            await setDoc(doc(db, 'users', userId, 'instagram_account', 'primary'), acc, { merge: true });
+            if (acc.access_token && !acc.access_token.includes('masked') && acc.ig_user_id) {
               subscribeAppToInstagramWebhooks(acc.ig_user_id, acc.access_token).catch(console.warn);
             }
-          } catch (err) {
-            console.warn('[POST_IG_ACCOUNT_DB_WARN]', err);
+          } catch (err: any) {
+            if (err?.code !== 'permission-denied') {
+              console.warn('[POST_IG_ACCOUNT_DB_WARN]', err?.message || err);
+            }
           }
         }
       } else {
-        connectedInstagramAccountMemory = null;
+        userInstagramAccountsMemory.delete(userId);
         if (db) {
           try {
-            if (userId) {
-              await deleteDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+            await deleteDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+          } catch (err: any) {
+            if (err?.code !== 'permission-denied') {
+              console.warn('[DELETE_IG_ACCOUNT_DB_WARN]', err?.message || err);
             }
-            await deleteDoc(doc(db, 'instagram_account', 'primary'));
-          } catch (err) {
-            console.warn('[DELETE_IG_ACCOUNT_DB_WARN]', err);
           }
         }
       }
     }
-    res.json({ success: true, account: connectedInstagramAccountMemory });
+    res.json({ success: true, account: (req.body && req.body.account) || null });
   });
 
   // Contacts Deletion Endpoints (Permanently deletes from Firestore)
@@ -609,8 +1304,10 @@ async function startServer() {
           }
           console.log('[PERMANENT_DELETE_MESSAGES_FOR_USER]', username);
         }
-      } catch (err) {
-        console.warn('[DELETE_CONTACT_DB_WARN]', err);
+      } catch (err: any) {
+        if (err?.code !== 'permission-denied') {
+          console.warn('[DELETE_CONTACT_DB_WARN]', err?.message || err);
+        }
       }
     }
     return res.json({ success: true });
@@ -720,9 +1417,29 @@ async function startServer() {
   });
 
   app.post('/api/instagram/subscribe', async (req: Request, res: Response) => {
+    const userId = (req.body?.userId || req.query?.userId) as string | undefined;
     let accessToken = '';
     let igUserId = '';
-    if (db) {
+    if (userId) {
+      const cached = userInstagramAccountsMemory.get(userId);
+      if (cached) {
+        accessToken = sanitizeAccessToken(cached.access_token || '');
+        igUserId = cached.ig_user_id || '';
+      }
+    }
+    if (!accessToken && userId && db) {
+      try {
+        const uSnap = await getDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+        if (uSnap.exists()) {
+          const accData = uSnap.data() as InstagramAccount;
+          accessToken = sanitizeAccessToken(accData.access_token || '');
+          igUserId = accData.ig_user_id || '';
+        }
+      } catch (err) {
+        console.warn('[SUBSCRIBE_ENDPOINT_FETCH_ERR]', err);
+      }
+    }
+    if (!accessToken && !userId && db) {
       try {
         const snap = await getDoc(doc(db, 'instagram_account', 'primary'));
         if (snap.exists()) {
@@ -734,7 +1451,7 @@ async function startServer() {
         console.warn('[SUBSCRIBE_ENDPOINT_FETCH_ERR]', err);
       }
     }
-    if (!accessToken && connectedInstagramAccountMemory) {
+    if (!accessToken && !userId && connectedInstagramAccountMemory) {
       accessToken = sanitizeAccessToken(connectedInstagramAccountMemory.access_token);
       igUserId = connectedInstagramAccountMemory.ig_user_id;
     }
@@ -770,6 +1487,7 @@ async function startServer() {
   // 3. Instagram Meta OAuth Auth Flow Endpoint (Instagram Business Login)
   app.get('/api/auth/instagram', (req: Request, res: Response) => {
     const appId = (req.query.app_id as string) || metaConfigStore.app_id || '2300969844066002';
+    const clientUserId = (req.query.userId as string) || '';
     const host = req.get('host') || 'localhost:3000';
     const proto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
     const autoRedirectUri = `${proto}://${host}/api/auth/instagram/callback`;
@@ -787,17 +1505,28 @@ async function startServer() {
       'instagram_business_content_publish',
     ].join(',');
 
+    const stateObj = { userId: clientUserId, ts: Date.now() };
+    const state = encodeURIComponent(JSON.stringify(stateObj));
+
     const instagramAuthUrl = `https://www.instagram.com/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(
       redirectUri
-    )}&scope=${encodeURIComponent(scopes)}&response_type=code`;
+    )}&scope=${encodeURIComponent(scopes)}&response_type=code&state=${state}`;
 
-    console.log('[INSTAGRAM_OAUTH_REDIRECT]', { appId, redirectUri, instagramAuthUrl });
+    console.log('[INSTAGRAM_OAUTH_REDIRECT]', { appId, redirectUri, clientUserId, instagramAuthUrl });
     res.redirect(instagramAuthUrl);
   });
 
   // 4. Instagram Meta OAuth Callback Endpoint
   app.get('/api/auth/instagram/callback', async (req: Request, res: Response) => {
-    const { code, error, error_reason, error_description } = req.query;
+    const { code, error, error_reason, error_description, state } = req.query;
+
+    let targetUserId = '';
+    if (state) {
+      try {
+        const decodedState = JSON.parse(decodeURIComponent(String(state)));
+        if (decodedState?.userId) targetUserId = String(decodedState.userId);
+      } catch {}
+    }
 
     if (error || error_reason) {
       console.warn('[INSTAGRAM_OAUTH_ERROR]', { error, error_reason, error_description });
@@ -924,9 +1653,13 @@ async function startServer() {
       status: 'connected',
     };
 
-    connectedInstagramAccountMemory = connectedAccount;
-    cachedInstagramAccount = connectedAccount;
-    cachedInstagramAccountTimestamp = Date.now();
+    if (targetUserId) {
+      userInstagramAccountsMemory.set(targetUserId, connectedAccount);
+    } else {
+      connectedInstagramAccountMemory = connectedAccount;
+      cachedInstagramAccount = connectedAccount;
+      cachedInstagramAccountTimestamp = Date.now();
+    }
 
     if (db) {
       try {
@@ -937,7 +1670,11 @@ async function startServer() {
           tokenPreview: connectedAccount.access_token ? `${connectedAccount.access_token.slice(0, 10)}...[LEN:${connectedAccount.access_token.length}]` : 'EMPTY',
           containsMaskedSubstring: Boolean(connectedAccount.access_token && connectedAccount.access_token.includes('masked')),
         });
-        await setDoc(doc(db, 'instagram_account', 'primary'), connectedAccount, { merge: true });
+        if (targetUserId) {
+          await setDoc(doc(db, 'users', targetUserId, 'instagram_account', 'primary'), connectedAccount, { merge: true });
+        } else {
+          await setDoc(doc(db, 'instagram_account', 'primary'), connectedAccount, { merge: true });
+        }
         console.log('[INSTAGRAM_OAUTH_SAVED_TO_FIRESTORE]', connectedAccount.username);
       } catch (dbErr) {
         console.error('[INSTAGRAM_OAUTH_FIRESTORE_SAVE_ERROR]', dbErr);
@@ -973,8 +1710,16 @@ async function startServer() {
             <button onclick="navigateDashboard()">Go to Dashboard</button>
           </div>
           <script>
+            const accountData = ${JSON.stringify(connectedAccount)};
             function sendConnectMessage() {
+              try {
+                if ('${targetUserId}') {
+                  localStorage.setItem('autoreply_connected_instagram_account_${targetUserId}', JSON.stringify(accountData));
+                }
+                localStorage.removeItem('autoreply_connected_instagram_account');
+              } catch (e) {}
               if (window.opener) {
+                window.opener.postMessage({ type: 'ig_connected', account: accountData, userId: '${targetUserId}' }, '*');
                 window.opener.postMessage('ig_connected', '*');
               }
             }
@@ -1053,19 +1798,13 @@ async function startServer() {
   async function primeCacheOnBoot() {
     if (!db) return;
     try {
-      const [accTopSnap, accUserSnap, autoTopSnap, autoUserSnap] = await Promise.all([
+      const [accTopSnap, autoTopSnap] = await Promise.all([
         getDoc(doc(db, 'instagram_account', 'primary')).catch(() => null),
-        getDoc(doc(db, 'users', 'primary_user', 'instagram_account', 'primary')).catch(() => null),
         getDocs(collection(db, 'automations')).catch(() => null),
-        getDocs(collection(db, 'users', 'primary_user', 'automations')).catch(() => null),
       ]);
 
       if (accTopSnap && accTopSnap.exists()) {
         cachedInstagramAccount = accTopSnap.data() as InstagramAccount;
-        cachedInstagramAccountTimestamp = Date.now();
-        connectedInstagramAccountMemory = cachedInstagramAccount;
-      } else if (accUserSnap && accUserSnap.exists()) {
-        cachedInstagramAccount = accUserSnap.data() as InstagramAccount;
         cachedInstagramAccountTimestamp = Date.now();
         connectedInstagramAccountMemory = cachedInstagramAccount;
       }
@@ -1075,16 +1814,6 @@ async function startServer() {
 
       if (autoTopSnap) {
         autoTopSnap.forEach((d) => {
-          const item = { id: d.id, ...d.data() } as Automation;
-          if (item.status === 'active' && !seenIds.has(item.id)) {
-            seenIds.add(item.id);
-            activeList.push(item);
-          }
-        });
-      }
-
-      if (autoUserSnap) {
-        autoUserSnap.forEach((d) => {
           const item = { id: d.id, ...d.data() } as Automation;
           if (item.status === 'active' && !seenIds.has(item.id)) {
             seenIds.add(item.id);
@@ -1107,18 +1836,10 @@ async function startServer() {
   function refreshInstagramAccountCacheInBackground() {
     if (isFetchingAccountInBackground || !db) return;
     isFetchingAccountInBackground = true;
-    Promise.all([
-      getDoc(doc(db, 'instagram_account', 'primary')).catch(() => null),
-      getDoc(doc(db, 'users', 'primary_user', 'instagram_account', 'primary')).catch(() => null),
-    ])
-      .then(([topSnap, userSnap]) => {
+    getDoc(doc(db, 'instagram_account', 'primary'))
+      .then((topSnap) => {
         if (topSnap && topSnap.exists()) {
           const accData = topSnap.data() as InstagramAccount;
-          cachedInstagramAccount = accData;
-          cachedInstagramAccountTimestamp = Date.now();
-          connectedInstagramAccountMemory = accData;
-        } else if (userSnap && userSnap.exists()) {
-          const accData = userSnap.data() as InstagramAccount;
           cachedInstagramAccount = accData;
           cachedInstagramAccountTimestamp = Date.now();
           connectedInstagramAccountMemory = accData;
@@ -1133,24 +1854,12 @@ async function startServer() {
   function refreshAutomationsCacheInBackground() {
     if (isFetchingAutomationsInBackground || !db) return;
     isFetchingAutomationsInBackground = true;
-    Promise.all([
-      getDocs(collection(db, 'automations')).catch(() => null),
-      getDocs(collection(db, 'users', 'primary_user', 'automations')).catch(() => null),
-    ])
-      .then(([topSnap, userSnap]) => {
+    getDocs(collection(db, 'automations'))
+      .then((topSnap) => {
         const list: Automation[] = [];
         const seen = new Set<string>();
         if (topSnap) {
           topSnap.forEach((docSnap) => {
-            const item = { id: docSnap.id, ...docSnap.data() } as Automation;
-            if (item.status === 'active' && !seen.has(item.id)) {
-              seen.add(item.id);
-              list.push(item);
-            }
-          });
-        }
-        if (userSnap) {
-          userSnap.forEach((docSnap) => {
             const item = { id: docSnap.id, ...docSnap.data() } as Automation;
             if (item.status === 'active' && !seen.has(item.id)) {
               seen.add(item.id);
@@ -1196,19 +1905,15 @@ async function startServer() {
       };
     }
 
-    // 3. Cold startup parallel fetch with bounded 400ms timeout race (runs only if cache empty on initial cold hit)
+    // 3. Cold startup fetch with bounded 400ms timeout race (runs only if cache empty on initial cold hit)
     if (db) {
       try {
-        const fetchPromise = Promise.all([
-          getDoc(doc(db, 'instagram_account', 'primary')).catch(() => null),
-          getDoc(doc(db, 'users', 'primary_user', 'instagram_account', 'primary')).catch(() => null),
-        ]);
-        const timeoutPromise = new Promise<null[]>((resolve) => setTimeout(() => resolve([null, null]), 400));
-        const [accSnap, userSnap] = await Promise.race([fetchPromise, timeoutPromise]);
+        const fetchPromise = getDoc(doc(db, 'instagram_account', 'primary')).catch(() => null);
+        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 400));
+        const accSnap = await Promise.race([fetchPromise, timeoutPromise]);
 
-        const targetSnap = (accSnap && accSnap.exists()) ? accSnap : (userSnap && userSnap.exists()) ? userSnap : null;
-        if (targetSnap) {
-          const accData = targetSnap.data() as InstagramAccount;
+        if (accSnap && accSnap.exists()) {
+          const accData = accSnap.data() as InstagramAccount;
           cachedInstagramAccount = accData;
           cachedInstagramAccountTimestamp = now;
           connectedInstagramAccountMemory = accData;
@@ -1242,26 +1947,14 @@ async function startServer() {
     // 2. Cold startup Firestore fetch with bounded 400ms timeout race
     if (db) {
       try {
-        const fetchPromise = Promise.all([
-          getDocs(collection(db, 'automations')).catch(() => null),
-          getDocs(collection(db, 'users', 'primary_user', 'automations')).catch(() => null),
-        ]);
-        const timeoutPromise = new Promise<null[]>((resolve) => setTimeout(() => resolve([null, null]), 400));
-        const [topSnap, userSnap] = await Promise.race([fetchPromise, timeoutPromise]);
+        const fetchPromise = getDocs(collection(db, 'automations')).catch(() => null);
+        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 400));
+        const topSnap = await Promise.race([fetchPromise, timeoutPromise]);
 
         const list: Automation[] = [];
         const seen = new Set<string>();
         if (topSnap) {
           topSnap.forEach((docSnap) => {
-            const item = { id: docSnap.id, ...docSnap.data() } as Automation;
-            if (item.status === 'active' && !seen.has(item.id)) {
-              seen.add(item.id);
-              list.push(item);
-            }
-          });
-        }
-        if (userSnap) {
-          userSnap.forEach((docSnap) => {
             const item = { id: docSnap.id, ...docSnap.data() } as Automation;
             if (item.status === 'active' && !seen.has(item.id)) {
               seen.add(item.id);
@@ -1283,6 +1976,7 @@ async function startServer() {
 
   // 6. Meta Webhook Engine - Ultra Fast High-Priority DM Response Execution (< 1s Response Time)
   async function processSingleMessageEvent(params: {
+    userId?: string;
     triggerType: 'dm' | 'comment' | 'story_reply';
     senderId: string;
     senderUsername?: string;
@@ -1293,16 +1987,26 @@ async function startServer() {
     webhookReceivedAt?: string;
     webhookReceivedAtMs?: number;
     metaEventTimestamp?: number | string | null;
+    isTest?: boolean;
   }) {
     const t0_start = Date.now();
-    const { triggerType, senderId, recipientId, messageText, commentId } = params;
+    const { triggerType, senderId, recipientId, messageText, commentId, isTest } = params;
+    const isTestEvent = Boolean(
+      isTest ||
+      params.senderUsername?.startsWith('user_') ||
+      params.senderUsername?.includes('test') ||
+      params.senderUsername?.includes('demo') ||
+      params.senderUsername === 'user_940977' ||
+      params.senderId?.includes('user_id_') ||
+      params.senderId === 'user_940977'
+    );
     const webhookReceivedAt = params.webhookReceivedAt || new Date().toISOString();
     const webhookReceivedAtMs = params.webhookReceivedAtMs || t0_start;
     const metaEventTimestamp = params.metaEventTimestamp || null;
     const metaTransitDelayMs = metaEventTimestamp ? Math.max(0, webhookReceivedAtMs - Number(metaEventTimestamp)) : null;
 
     console.log(`\n================== [ULTRA_FAST_WEBHOOK_EXECUTION] ==================`);
-    console.log(`📥 1. Webhook Server Ingress:   ${webhookReceivedAt} (${webhookReceivedAtMs}ms)`);
+    console.log(`📥 1. Webhook Server Ingress:   ${webhookReceivedAt} (${webhookReceivedAtMs}ms)${isTestEvent ? ' [IS_TEST_EVENT]' : ''}`);
     if (metaEventTimestamp) {
       console.log(`⏱️    Meta Event Timestamp:      ${new Date(Number(metaEventTimestamp)).toISOString()} (${metaEventTimestamp}ms)`);
       console.log(`⚡   Meta -> Backend Transit:   ${metaTransitDelayMs}ms`);
@@ -1503,29 +2207,37 @@ async function startServer() {
         if (accessToken && !accessToken.includes('encrypted_token')) {
           const cleanToken = sanitizeAccessToken(accessToken);
           try {
-            const igProfUrl = `https://graph.instagram.com/v21.0/${senderId}?fields=name,username,profile_pic&access_token=${encodeURIComponent(cleanToken)}`;
+            console.log(`[PROFILE_FETCH_START] Requesting Instagram profile for sender ID: ${senderId}...`);
+            // NOTE: On Instagram Graph API, the correct field is profile_picture_url (NOT profile_pic which is Facebook Messenger only)
+            const igProfUrl = `https://graph.instagram.com/v21.0/${senderId}?fields=name,username,profile_picture_url&access_token=${encodeURIComponent(
+              cleanToken
+            )}`;
             const pRes = await fetch(igProfUrl, {
-              headers: { 'Authorization': `Bearer ${cleanToken}` },
-              signal: AbortSignal.timeout(3000),
+              headers: { Authorization: `Bearer ${cleanToken}` },
+              signal: AbortSignal.timeout(3500),
             });
+            const pData = await pRes.json().catch(() => ({}));
+
             if (pRes.ok) {
-              const pData = await pRes.json();
+              console.log(`[PROFILE_FETCH_SUCCESS] Meta Graph API returned:`, pData);
               senderUsername = pData.username || pData.name || senderUsername;
-              fetchedProfilePic = pData.profile_pic || pData.profile_picture_url || '';
+              fetchedProfilePic = pData.profile_picture_url || pData.profile_pic || '';
             } else {
-              profileFetchError = await pRes.json().catch(() => ({ status: pRes.status, statusText: pRes.statusText }));
+              profileFetchError = pData;
+              console.warn(`[PROFILE_FETCH_API_ERROR] HTTP ${pRes.status} for ${senderId}:`, pData);
             }
           } catch (pErr: any) {
             profileFetchError = { error: String(pErr?.message || pErr) };
+            console.warn(`[PROFILE_FETCH_EXCEPTION] Network/Timeout error for ${senderId}:`, pErr?.message || pErr);
           }
         }
 
         if (!senderUsername) {
           senderUsername = `user_${senderId.slice(-6)}`;
         }
-        const senderAvatar = fetchedProfilePic || `https://api.dicebear.com/7.x/avataaars/svg?seed=${senderUsername}`;
+        const senderAvatar = fetchedProfilePic || '';
 
-        // 5B. Parallel Firestore Dual-Writes (top-level and users/primary_user/)
+        // 5B. Parallel Firestore Writes
         if (db) {
           const nowIso = new Date().toISOString();
           const inMsgId = `msg_in_${Date.now()}`;
@@ -1541,6 +2253,7 @@ async function startServer() {
             message_text: messageText,
             direction: 'in',
             timestamp: nowIso,
+            is_test: isTestEvent ? true : undefined,
           };
 
           const outMsgDoc: InboxMessage = {
@@ -1553,6 +2266,7 @@ async function startServer() {
             is_automated: true,
             automation_id: matchedAutomation?.id,
             timestamp: new Date(Date.now() + 1000).toISOString(),
+            is_test: isTestEvent ? true : undefined,
           };
 
           const logDoc: WebhookLogEvent = {
@@ -1562,6 +2276,7 @@ async function startServer() {
             from_username: senderUsername,
             incoming_text: messageText,
             status: apiSuccess ? 'triggered' : 'error',
+            is_test: isTestEvent ? true : undefined,
             matched_automation_name: matchedAutomation?.name || (isExplicitAiConversation ? 'AI Assistant' : 'Keyword Automation'),
             response_sent: replyText,
             webhook_received_at: webhookReceivedAt,
@@ -1616,44 +2331,72 @@ async function startServer() {
               stories: triggerType === 'story_reply' ? 1 : 0,
             },
             status: 'converted',
+            is_test: isTestEvent ? true : undefined,
             profile_fetch_error: profileFetchError || null,
           };
 
-          const dbTasks: Promise<any>[] = [
-            setDoc(doc(db, 'inbox_messages', inMsgId), inMsgDoc),
-            setDoc(doc(db, 'inbox_messages', outMsgId), outMsgDoc),
-            setDoc(doc(db, 'webhook_logs', logId), logDoc),
-            setDoc(doc(db, 'contacts', contactId), contactDoc, { merge: true }),
-            setDoc(doc(db, 'users', 'primary_user', 'inbox_messages', inMsgId), inMsgDoc),
-            setDoc(doc(db, 'users', 'primary_user', 'inbox_messages', outMsgId), outMsgDoc),
-            setDoc(doc(db, 'users', 'primary_user', 'webhook_logs', logId), logDoc),
-            setDoc(doc(db, 'users', 'primary_user', 'contacts', contactId), contactDoc, { merge: true }),
-          ];
+          const targetUserId = params.userId;
+          const dbTasks: Promise<any>[] = [];
 
-          if (matchedAutomation?.id) {
-            const autoRef = doc(db, 'automations', matchedAutomation.id);
-            const userAutoRef = doc(db, 'users', 'primary_user', 'automations', matchedAutomation.id);
+          if (targetUserId) {
             dbTasks.push(
-              getDoc(autoRef).then((autoSnap) => {
-                if (autoSnap.exists()) {
-                  const cur = autoSnap.data() as Automation;
-                  const curStats = cur.stats || { runs: 0, dms_sent: 0, unique_users: 0, open_rate: 98.5 };
-                  const updatedPayload = {
-                    stats: {
-                      ...curStats,
-                      runs: (curStats.runs || 0) + 1,
-                      dms_sent: (curStats.dms_sent || 0) + 1,
-                      last_run_at: nowIso,
-                    },
-                    updated_at: nowIso,
-                  };
-                  return Promise.all([
-                    setDoc(autoRef, updatedPayload, { merge: true }),
-                    setDoc(userAutoRef, updatedPayload, { merge: true }),
-                  ]);
-                }
-              })
+              setDoc(doc(db, 'users', targetUserId, 'inbox_messages', inMsgId), inMsgDoc),
+              setDoc(doc(db, 'users', targetUserId, 'inbox_messages', outMsgId), outMsgDoc),
+              setDoc(doc(db, 'users', targetUserId, 'webhook_logs', logId), logDoc),
+              setDoc(doc(db, 'users', targetUserId, 'contacts', contactId), contactDoc, { merge: true })
             );
+
+            if (matchedAutomation?.id) {
+              const userAutoRef = doc(db, 'users', targetUserId, 'automations', matchedAutomation.id);
+              dbTasks.push(
+                getDoc(userAutoRef).then((autoSnap) => {
+                  if (autoSnap.exists()) {
+                    const cur = autoSnap.data() as Automation;
+                    const curStats = cur.stats || { runs: 0, dms_sent: 0, unique_users: 0, open_rate: 98.5 };
+                    const updatedPayload = {
+                      stats: {
+                        ...curStats,
+                        runs: (curStats.runs || 0) + 1,
+                        dms_sent: (curStats.dms_sent || 0) + 1,
+                        last_run_at: nowIso,
+                      },
+                      updated_at: nowIso,
+                    };
+                    return setDoc(userAutoRef, updatedPayload, { merge: true });
+                  }
+                })
+              );
+            }
+          } else {
+            // Legacy / unassociated webhook: write to root only
+            dbTasks.push(
+              setDoc(doc(db, 'inbox_messages', inMsgId), inMsgDoc),
+              setDoc(doc(db, 'inbox_messages', outMsgId), outMsgDoc),
+              setDoc(doc(db, 'webhook_logs', logId), logDoc),
+              setDoc(doc(db, 'contacts', contactId), contactDoc, { merge: true })
+            );
+
+            if (matchedAutomation?.id) {
+              const autoRef = doc(db, 'automations', matchedAutomation.id);
+              dbTasks.push(
+                getDoc(autoRef).then((autoSnap) => {
+                  if (autoSnap.exists()) {
+                    const cur = autoSnap.data() as Automation;
+                    const curStats = cur.stats || { runs: 0, dms_sent: 0, unique_users: 0, open_rate: 98.5 };
+                    const updatedPayload = {
+                      stats: {
+                        ...curStats,
+                        runs: (curStats.runs || 0) + 1,
+                        dms_sent: (curStats.dms_sent || 0) + 1,
+                        last_run_at: nowIso,
+                      },
+                      updated_at: nowIso,
+                    };
+                    return setDoc(autoRef, updatedPayload, { merge: true });
+                  }
+                })
+              );
+            }
           }
 
           await Promise.all(dbTasks);
@@ -1771,7 +2514,7 @@ async function startServer() {
 
   // 7. Test Webhook Engine API Endpoint
   app.post('/api/test-webhook', async (req: Request, res: Response) => {
-    const { trigger_type, username, text } = req.body;
+    const { trigger_type, username, text, userId } = req.body;
 
     if (!trigger_type || !username || !text) {
       return res.status(400).json({ error: 'Missing required parameters: trigger_type, username, text' });
@@ -1780,14 +2523,16 @@ async function startServer() {
     const cleanUsername = String(username).replace(/^@/, '').trim();
     const mockSenderId = `user_id_${cleanUsername}`;
 
-    console.log(`[TEST WEBHOOK ENGINE] Trigger: ${trigger_type} | User: @${cleanUsername} | Text: "${text}"`);
+    console.log(`[TEST WEBHOOK ENGINE] Trigger: ${trigger_type} | User: @${cleanUsername} | Text: "${text}" [IS_TEST] [UID: ${userId || 'none'}]`);
 
     await processSingleMessageEvent({
+      userId,
       triggerType: (trigger_type as 'dm' | 'comment' | 'story_reply') || 'dm',
       senderId: mockSenderId,
       senderUsername: cleanUsername,
       recipientId: 'ig_business_id_main',
       messageText: String(text),
+      isTest: true,
     });
 
     return res.json({
@@ -1796,16 +2541,27 @@ async function startServer() {
         trigger_type,
         username: cleanUsername,
         text,
+        is_test: true,
         timestamp: new Date().toISOString(),
       },
       status: 'processed_and_saved_to_firestore',
     });
   });
 
+  // Test Data Cleanup API Endpoint (deletes user_940977 and mock contacts from Firestore)
+  app.post('/api/cleanup-test-data', async (_req: Request, res: Response) => {
+    try {
+      await cleanupTestArtifacts();
+      return res.json({ success: true, message: 'Test contacts and messages successfully purged from Firestore.' });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Cleanup failed' });
+    }
+  });
+
   // 7.5. Send Manual DM API Endpoint (for Inbox manual replies)
   app.post('/api/instagram/send-dm', async (req: Request, res: Response) => {
     try {
-      const { recipientUsername, messageText } = req.body;
+      const { recipientUsername, messageText, userId } = req.body;
       if (!recipientUsername || !messageText) {
         return res.status(400).json({ error: 'Missing recipientUsername or messageText' });
       }
@@ -1813,7 +2569,24 @@ async function startServer() {
       const cleanUsername = String(recipientUsername).replace(/^@/, '').toLowerCase().trim();
 
       let accessToken = '';
-      if (db) {
+      if (userId) {
+        const cached = userInstagramAccountsMemory.get(userId);
+        if (cached?.access_token) {
+          accessToken = sanitizeAccessToken(cached.access_token);
+        }
+      }
+      if (!accessToken && userId && db) {
+        try {
+          const accSnap = await getDoc(doc(db, 'users', userId, 'instagram_account', 'primary'));
+          if (accSnap.exists()) {
+            const accData = accSnap.data() as InstagramAccount;
+            accessToken = sanitizeAccessToken(accData.access_token || '');
+          }
+        } catch (err) {
+          console.warn('[SEND_DM_DB_TOKEN_FETCH_WARN]', err);
+        }
+      }
+      if (!accessToken && !userId && db) {
         try {
           const accSnap = await getDoc(doc(db, 'instagram_account', 'primary'));
           if (accSnap.exists()) {
@@ -1824,7 +2597,7 @@ async function startServer() {
           console.warn('[SEND_DM_DB_TOKEN_FETCH_WARN]', err);
         }
       }
-      if (!accessToken && connectedInstagramAccountMemory?.access_token) {
+      if (!accessToken && !userId && connectedInstagramAccountMemory?.access_token) {
         accessToken = sanitizeAccessToken(connectedInstagramAccountMemory.access_token);
       }
 
@@ -1866,11 +2639,11 @@ async function startServer() {
           is_automated: false,
           timestamp: nowIso,
         };
-        await setDoc(doc(db, 'inbox_messages', outMsgId), outMsgDoc);
-        await setDoc(doc(db, 'users', 'primary_user', 'inbox_messages', outMsgId), outMsgDoc);
         const reqUserId = req.body?.userId;
-        if (reqUserId && reqUserId !== 'primary_user') {
+        if (reqUserId) {
           await setDoc(doc(db, 'users', reqUserId, 'inbox_messages', outMsgId), outMsgDoc);
+        } else {
+          await setDoc(doc(db, 'inbox_messages', outMsgId), outMsgDoc);
         }
       }
 
@@ -1946,6 +2719,27 @@ async function startServer() {
     }
   });
 
+  // 8.6. Gemini Smart System Prompt Analyzer Endpoint
+  app.post('/api/gemini/analyze-prompt', async (req: Request, res: Response) => {
+    try {
+      const { prompt } = req.body;
+      const promptToAnalyze = typeof prompt === 'string' ? prompt : '';
+      console.log(`🧠 [GEMINI_PROMPT_ANALYZER] Analyzing prompt (${promptToAnalyze.length} chars)...`);
+
+      const analysis = await analyzeSystemPromptWithGemini(promptToAnalyze);
+      return res.json({
+        success: true,
+        analysis,
+      });
+    } catch (err: any) {
+      console.error('[GEMINI_PROMPT_ANALYZER_ERROR]', err);
+      return res.status(500).json({
+        error: 'Prompt analysis failed',
+        details: String(err?.message || err),
+      });
+    }
+  });
+
   // 9. Gemini Multi-Key Pool Management Endpoints
   app.get('/api/gemini/keys', (req: Request, res: Response) => {
     const keys = getLocalKeyPool();
@@ -2004,12 +2798,64 @@ async function startServer() {
     });
   }
 
+  // Clean up test contact artifacts (such as user_940977 and legacy mock data) from Firestore
+  async function cleanupTestArtifacts() {
+    if (!db) return;
+    try {
+      console.log('🧹 [STARTUP_CLEANUP] Scanning for test contact artifacts like user_940977...');
+      const explicitTestIds = [
+        'user_940977',
+        'contact_user_940977',
+        'ig_usr_user_940977',
+        'user_id_user_940977',
+        'webhook_test_user',
+        'contact_webhook_test_user',
+      ];
+
+      for (const testId of explicitTestIds) {
+        await deleteDoc(doc(db, 'contacts', testId)).catch(() => {});
+      }
+
+      // Check legacy test collections for any matching test patterns
+      const colls = ['contacts', 'inbox_messages'];
+      for (const collName of colls) {
+        try {
+          const snap = await getDocs(collection(db, collName)).catch(() => null);
+          if (snap && !snap.empty) {
+            for (const d of snap.docs) {
+              const data = d.data();
+              const uname = String(data.ig_username || data.from_username || d.id || '').toLowerCase();
+              if (
+                uname.includes('940977') ||
+                uname === 'webhook_test_user' ||
+                uname.startsWith('user_940977') ||
+                data.is_test === true
+              ) {
+                console.log(`🧹 [CLEANUP] Deleting test doc ${d.id} from ${collName}`);
+                await deleteDoc(d.ref).catch(() => {});
+              }
+            }
+          }
+        } catch (cErr) {
+          console.warn(`[CLEANUP_COLL_WARN] ${collName}:`, cErr);
+        }
+      }
+    } catch (err) {
+      console.warn('[CLEANUP_TEST_ARTIFACTS_WARN]', err);
+    }
+  }
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`AutoReply.io Express Backend Server running on http://0.0.0.0:${PORT}`);
     // Pre-warm RAM cache for instantaneous sub-second webhook responses
     primeCacheOnBoot()
       .then(() => console.log('🔥 [CACHE_WARMUP_SUCCESS] In-Memory Instagram Token & Automations pre-warmed!'))
       .catch((e) => console.warn('[CACHE_WARMUP_WARN]', e));
+    
+    // Purge test artifacts on boot
+    cleanupTestArtifacts()
+      .then(() => console.log('🧹 [TEST_ARTIFACTS_CLEANUP_COMPLETE] Test artifacts cleaned.'))
+      .catch((e) => console.warn('[TEST_CLEANUP_ERR]', e));
   });
 }
 

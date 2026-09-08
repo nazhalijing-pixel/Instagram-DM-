@@ -20,8 +20,12 @@ import {
   Send,
   Cpu,
   Server,
+  Image as ImageIcon,
+  Eye,
+  X,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { UserAvatar } from '../Common/UserAvatar';
 
 export const SettingsPage: React.FC = () => {
   const {
@@ -43,6 +47,54 @@ export const SettingsPage: React.FC = () => {
   const [testSimulating, setTestSimulating] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
 
+  // Profile Picture Refresh & Diagnostics State
+  const [refreshingPic, setRefreshingPic] = useState(false);
+  const [refreshPicMessage, setRefreshPicMessage] = useState<{ success: boolean; text: string } | null>(null);
+  const [debugModalOpen, setDebugModalOpen] = useState(false);
+  const [debugReport, setDebugReport] = useState<any>(null);
+  const [loadingDebug, setLoadingDebug] = useState(false);
+
+  const handleRefreshProfilePic = async () => {
+    setRefreshingPic(true);
+    setRefreshPicMessage(null);
+    if (!firebaseUser?.uid) return;
+    try {
+      const res = await fetch('/api/instagram/refresh-profile-pic', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: firebaseUser.uid }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setRefreshPicMessage({ success: true, text: 'Profile picture refreshed from Meta Graph API!' });
+        setTimeout(() => {
+          window.location.reload();
+        }, 800);
+      } else {
+        setRefreshPicMessage({ success: false, text: data.error || 'Failed to refresh picture.' });
+      }
+    } catch (err: any) {
+      setRefreshPicMessage({ success: false, text: err?.message || 'Network error' });
+    } finally {
+      setRefreshingPic(false);
+    }
+  };
+
+  const handleLoadDiagnostics = async () => {
+    setLoadingDebug(true);
+    setDebugModalOpen(true);
+    try {
+      const res = await fetch('/api/instagram/debug-avatars');
+      const data = await res.json();
+      setDebugReport(data);
+      console.log('[DEBUG_AVATARS_REPORT]', data);
+    } catch (err: any) {
+      setDebugReport({ error: err?.message || String(err) });
+    } finally {
+      setLoadingDebug(false);
+    }
+  };
+
   const webhookUrl = typeof window !== 'undefined' ? `${window.location.origin}/api/webhook` : '/api/webhook';
   const verifyToken = 'autoreply_meta_verify_secret_token_2026';
 
@@ -61,7 +113,7 @@ export const SettingsPage: React.FC = () => {
         username: 'webhook_test_user',
         text: 'Hello, this is a test webhook message to verify delivery.',
       });
-      setTestResult('✅ Test webhook processed successfully! Check your Inbox tab to see the incoming message & auto-reply.');
+      setTestResult('✅ Test webhook simulated successfully! Telemetry diagnostics trace logged below (marked as test event to keep Contacts & Inbox clean).');
     } catch (err: any) {
       setTestResult(`❌ Test webhook failed: ${err?.message || err}`);
     } finally {
@@ -119,10 +171,10 @@ export const SettingsPage: React.FC = () => {
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-slate-50 p-4 rounded-xl border border-slate-200 shadow-2xs">
           <div className="flex items-center gap-3.5">
-            <img
-              src={user.avatar_url || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80'}
-              alt={user.name}
-              className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-xs"
+            <UserAvatar
+              src={user.avatar_url}
+              username={user.name}
+              size="lg"
             />
             <div>
               <div className="flex items-center gap-2">
@@ -142,7 +194,7 @@ export const SettingsPage: React.FC = () => {
             <button
               onClick={handleLogout}
               disabled={isLoggingOut}
-              className="w-full sm:w-auto bg-rose-50 hover:bg-rose-100 text-rose-700 font-black text-xs py-2.5 px-4 rounded-xl border border-rose-200 flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+              className="w-full sm:w-auto bg-rose-50 hover:bg-rose-100 text-rose-700 font-black text-xs py-2.5 px-4 rounded-xl border border-rose-200 flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-2xs disabled:opacity-50"
             >
               <LogOut className="w-4 h-4 text-rose-600" />
               <span>{isLoggingOut ? 'Signing out...' : 'Sign Out'}</span>
@@ -169,10 +221,11 @@ export const SettingsPage: React.FC = () => {
         {instagramAccount ? (
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-slate-50 p-4 rounded-xl border border-slate-200 shadow-2xs">
             <div className="flex items-center gap-3">
-              <img
+              <UserAvatar
                 src={instagramAccount.profile_pic_url}
-                alt={instagramAccount.username}
-                className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-xs"
+                username={instagramAccount.username}
+                showInstagramBadge={true}
+                size="lg"
               />
               <div>
                 <div className="flex items-center gap-2">
@@ -185,10 +238,29 @@ export const SettingsPage: React.FC = () => {
                   {instagramAccount.followers_count?.toLocaleString()} Followers • Connected on{' '}
                   {new Date(instagramAccount.connected_at).toLocaleDateString()}
                 </p>
+                {refreshPicMessage && (
+                  <p
+                    className={`text-[11px] font-bold mt-1 ${
+                      refreshPicMessage.success ? 'text-emerald-700' : 'text-rose-600'
+                    }`}
+                  >
+                    {refreshPicMessage.text}
+                  </p>
+                )}
               </div>
             </div>
 
             <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+              <button
+                onClick={handleRefreshProfilePic}
+                disabled={refreshingPic}
+                title="Force refresh latest profile picture from Instagram API"
+                className="bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs py-2 px-3.5 rounded-xl shadow-xs flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 stroke-[2.2] ${refreshingPic ? 'animate-spin' : ''}`} />
+                <span>{refreshingPic ? 'Refreshing...' : 'Refresh Photo'}</span>
+              </button>
+
               <button
                 onClick={() => setIsConnectModalOpen(true)}
                 title="Switch or update channel"
@@ -196,6 +268,15 @@ export const SettingsPage: React.FC = () => {
               >
                 <RefreshCw className="w-3.5 h-3.5 stroke-[2.2]" />
                 <span>Switch / Update</span>
+              </button>
+
+              <button
+                onClick={handleLoadDiagnostics}
+                title="Inspect avatar status in Firestore & Meta API"
+                className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-black text-xs py-2 px-3.5 rounded-xl border border-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+              >
+                <Eye className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Avatar Debug</span>
               </button>
 
               <button
@@ -516,6 +597,107 @@ export const SettingsPage: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* Diagnostic Avatar Status Modal */}
+      {debugModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-2xl w-full p-6 max-h-[85vh] overflow-y-auto space-y-4 shadow-2xl border border-slate-200">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center font-black text-xs">
+                  <Eye className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-black text-sm text-slate-900">Avatar & Profile Photo Diagnostics</h3>
+                  <p className="text-[11px] text-slate-500">Live inspection of Firestore data and Meta Graph API response</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setDebugModalOpen(false)}
+                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-700 rounded-lg transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {loadingDebug ? (
+              <div className="py-12 text-center text-xs text-slate-500 font-bold flex items-center justify-center gap-2">
+                <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
+                <span>Inspecting Firestore documents and testing Meta API endpoints...</span>
+              </div>
+            ) : debugReport ? (
+              <div className="space-y-4 text-xs">
+                <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200 text-blue-900 leading-relaxed font-medium">
+                  {debugReport.analysis}
+                </div>
+
+                <div className="space-y-2">
+                  <h4 className="font-black text-slate-900">Firestore Account (instagram_account/primary):</h4>
+                  <pre className="bg-slate-900 text-emerald-400 p-3 rounded-xl overflow-x-auto text-[11px] font-mono">
+                    {JSON.stringify(
+                      {
+                        firestore_data: debugReport.firestore_account_primary,
+                        profile_pic_http_status: debugReport.account_profile_pic_http_status,
+                      },
+                      null,
+                      2
+                    )}
+                  </pre>
+                </div>
+
+                <div className="space-y-2">
+                  <h4 className="font-black text-slate-900">Live Meta Graph API Test (/v21.0/me):</h4>
+                  <pre className="bg-slate-900 text-amber-300 p-3 rounded-xl overflow-x-auto text-[11px] font-mono">
+                    {JSON.stringify(debugReport.graph_api_test, null, 2)}
+                  </pre>
+                </div>
+
+                <div className="space-y-2">
+                  <h4 className="font-black text-slate-900">
+                    Contacts in Firestore ({debugReport.firestore_contacts_count || 0} total):
+                  </h4>
+                  <pre className="bg-slate-900 text-slate-200 p-3 rounded-xl overflow-x-auto text-[11px] font-mono">
+                    {JSON.stringify(debugReport.firestore_contacts, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="pt-3 border-t border-slate-200 flex justify-end">
+              <button
+                onClick={() => setDebugModalOpen(false)}
+                className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-black text-xs py-2 px-4 rounded-xl cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Footer */}
+      <footer className="pt-6 pb-2 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500 font-medium">
+        <div className="flex items-center gap-2">
+          <Zap className="w-4 h-4 text-indigo-600 fill-indigo-600/20" />
+          <span className="font-bold text-slate-800">AutoReply.io</span>
+          <span>•</span>
+          <span>Official Meta Graph API Social Automation Engine</span>
+        </div>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => {
+              if (typeof window !== 'undefined') {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }
+            }}
+            className="hover:text-slate-800 transition-colors cursor-pointer"
+          >
+            Back to Top
+          </button>
+          <span>•</span>
+          <span>&copy; 2026 AutoReply.io. All rights reserved.</span>
+        </div>
+      </footer>
     </div>
   );
 };

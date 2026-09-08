@@ -16,6 +16,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { UserAvatar } from '../Common/UserAvatar';
 
 export const HomePage: React.FC = () => {
   const {
@@ -236,23 +237,12 @@ export const HomePage: React.FC = () => {
           {isConnected && instagramAccount?.username ? (
             <div className="flex items-center gap-3 flex-wrap">
               {/* Profile Pic with Instagram Badge */}
-              <div className="relative inline-block shrink-0">
-                {instagramAccount.profile_pic_url ? (
-                  <img
-                    src={instagramAccount.profile_pic_url}
-                    alt={instagramAccount.username}
-                    className="w-8 h-8 rounded-full object-cover border border-slate-300 shadow-2xs bg-slate-100"
-                  />
-                ) : (
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black text-xs">
-                    {instagramAccount.username.charAt(0).toUpperCase()}
-                  </div>
-                )}
-                {/* Pink/Gradient Instagram Overlay Badge */}
-                <div className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-gradient-to-tr from-amber-500 via-rose-500 to-purple-600 flex items-center justify-center text-white ring-2 ring-white shadow-2xs">
-                  <Instagram className="w-2 h-2 stroke-[2.5]" />
-                </div>
-              </div>
+              <UserAvatar
+                src={instagramAccount.profile_pic_url}
+                username={instagramAccount.username}
+                showInstagramBadge={true}
+                size="sm"
+              />
 
               {/* Handle Name */}
               <span className="text-sm font-black text-slate-900 tracking-tight flex items-center gap-1.5">
@@ -490,6 +480,33 @@ export const HomePage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Footer */}
+      <footer className="pt-6 pb-2 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500 font-medium">
+        <div className="flex items-center gap-2">
+          <Zap className="w-4 h-4 text-indigo-600 fill-indigo-600/20" />
+          <span className="font-bold text-slate-800">AutoReply.io</span>
+          <span>•</span>
+          <span>Meta Graph API DM & Comment Automation</span>
+        </div>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setActiveTab('about')}
+            className="font-bold text-indigo-600 hover:underline cursor-pointer"
+          >
+            About Us
+          </button>
+          <span>•</span>
+          <button
+            onClick={() => setActiveTab('settings')}
+            className="hover:text-slate-800 transition-colors cursor-pointer"
+          >
+            Settings
+          </button>
+          <span>•</span>
+          <span>&copy; 2026 AutoReply.io. All rights reserved.</span>
+        </div>
+      </footer>
     </div>
   );
 };

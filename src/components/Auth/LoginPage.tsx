@@ -1,491 +1,554 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Zap,
-  Mail,
-  Lock,
-  User as UserIcon,
-  ArrowRight,
+  Eye,
+  EyeOff,
+  Loader2,
   AlertCircle,
   CheckCircle2,
-  Sparkles,
+  Copy,
+  ExternalLink,
+  ShieldAlert,
+  Smartphone,
+  Check,
+  Globe,
+  ArrowRight,
 } from 'lucide-react';
 import {
   auth,
   googleProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   sendPasswordResetEmail,
-  updateProfile,
 } from '../../lib/firebase';
-import { AuthDebugPanel, FirebaseErrorDetails } from './AuthDebugPanel';
+import { useApp } from '../../context/AppContext';
+import { TermsModal } from './TermsModal';
 
 interface LoginPageProps {
   onSuccess?: () => void;
 }
 
 export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess }) => {
-  const [isSignUp, setIsSignUp] = useState(false);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [fullName, setFullName] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [googleLoading, setGoogleLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [debugError, setDebugError] = useState<FirebaseErrorDetails | null>(null);
-  const [resetSent, setResetSent] = useState(false);
-  const [isForgotPassword, setIsForgotPassword] = useState(false);
+  const { setIsGuestMode, firebaseUser, setFirebaseUser, authLoading } = useApp();
 
-  const getCleanErrorMessage = (err: any): string => {
-    const code = err?.code || '';
-    const msg = err?.message || String(err);
+  const [email, setEmail] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
+  const [showPassword, setShowPassword] = useState<boolean>(false);
 
-    if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
-      return 'Invalid email or password. Please check your credentials and try again.';
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isGoogleLoading, setIsGoogleLoading] = useState<boolean>(false);
+  const [googleAuthMode, setGoogleAuthMode] = useState<'popup' | 'redirect'>('popup');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState<boolean>(false);
+
+  const wasRedirectPending = (() => {
+    try {
+      return typeof window !== 'undefined' && sessionStorage.getItem('firebase_redirect_pending') === 'true';
+    } catch {
+      return false;
     }
-    if (code === 'auth/email-already-in-use') {
-      return 'An account with this email already exists. Please sign in instead.';
-    }
-    if (code === 'auth/weak-password') {
-      return 'Password should be at least 6 characters long.';
-    }
-    if (code === 'auth/invalid-email') {
-      return 'Please enter a valid email address.';
-    }
-    if (code === 'auth/popup-closed-by-user') {
-      return 'Google sign-in popup was closed before completion.';
-    }
-    if (code === 'auth/network-request-failed') {
-      return 'Network error. Please check your internet connection.';
-    }
-    if (code === 'auth/too-many-requests') {
-      return 'Too many attempts. Please wait a moment before trying again.';
-    }
-    return msg.replace('Firebase: ', '').replace(/\(auth\/[^)]+\)/, '').trim();
+  })();
+
+  const [termsModalType, setTermsModalType] = useState<'terms' | 'privacy' | null>(null);
+
+  // Helper to detect mobile browser environment (touch devices)
+  const isMobileBrowser = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
   };
 
-  const handleEmailAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!auth) {
-      const errMsg = 'Firebase authentication service is currently initializing. Please try again.';
-      setError(errMsg);
-      setDebugError({
-        code: 'auth/not-initialized',
-        message: errMsg,
-        timestamp: new Date().toLocaleTimeString(),
-        attemptType: isSignUp ? 'email_signup' : 'email_login',
-      });
-      return;
+  // Immediate listener: if firebaseUser becomes available, proceed
+  useEffect(() => {
+    if (firebaseUser) {
+      setIsGuestMode(false);
+      try {
+        sessionStorage.removeItem('firebase_redirect_pending');
+      } catch {}
+      if (onSuccess) onSuccess();
     }
-    if (!email || !password) {
-      setError('Please fill in all required fields.');
+  }, [firebaseUser, onSuccess]);
+
+  // Clean up pending flag if authLoading finishes without an authenticated user
+  useEffect(() => {
+    if (!authLoading && !firebaseUser && wasRedirectPending) {
+      try {
+        sessionStorage.removeItem('firebase_redirect_pending');
+      } catch {}
+    }
+  }, [authLoading, firebaseUser, wasRedirectPending]);
+
+  // Copy current domain to clipboard
+  const handleCopyDomain = () => {
+    if (typeof window !== 'undefined' && window.location.hostname) {
+      navigator.clipboard.writeText(window.location.hostname);
+      setCopiedDomain(true);
+      setTimeout(() => setCopiedDomain(false), 2500);
+    }
+  };
+
+  // 2. Google Sign-In Handler (High-Reliability Popup First, Graceful Fallback)
+  const handleGoogleSignIn = async (forcedRedirect: boolean = false) => {
+    if (!auth || !googleProvider) {
+      setErrorMsg('Authentication service is not initialized. Please refresh and try again.');
       return;
     }
 
-    setLoading(true);
-    setError(null);
+    setIsGoogleLoading(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setUnauthorizedDomain(null);
 
+    // If explicit redirect is requested
+    if (forcedRedirect) {
+      try {
+        setGoogleAuthMode('redirect');
+        try {
+          sessionStorage.setItem('firebase_redirect_pending', 'true');
+        } catch {}
+        console.log('[GOOGLE_SIGNIN_REDIRECT_START] Launching signInWithRedirect...');
+        await signInWithRedirect(auth, googleProvider);
+        // Browser redirects away
+        return;
+      } catch (redirectErr: any) {
+        try {
+          sessionStorage.removeItem('firebase_redirect_pending');
+        } catch {}
+        console.error('[GOOGLE_REDIRECT_LAUNCH_ERR]', redirectErr);
+        if (redirectErr?.code === 'auth/unauthorized-domain') {
+          setUnauthorizedDomain(window.location.hostname);
+          setErrorMsg(`Domain "${window.location.hostname}" is not authorized in Firebase Console.`);
+        } else {
+          setErrorMsg(redirectErr?.message || 'Could not initiate Google Sign-In redirect.');
+        }
+        setIsGoogleLoading(false);
+        return;
+      }
+    }
+
+    // Default & Recommended: signInWithPopup
+    // Popup keeps the current SPA session alive in memory and eliminates redirect loops
     try {
-      if (isSignUp) {
-        const userCredential = await createUserWithEmailAndPassword(auth, email.trim(), password);
-        if (fullName.trim() && userCredential.user) {
+      setGoogleAuthMode('popup');
+      console.log('[GOOGLE_SIGNIN_POPUP_START] Launching signInWithPopup...');
+      const result = await signInWithPopup(auth, googleProvider);
+
+      if (result && result.user) {
+        setFirebaseUser(result.user);
+        setIsGuestMode(false);
+        setSuccessMsg(`Signed in as ${result.user.displayName || result.user.email}`);
+        console.log('[GOOGLE_SIGNIN_POPUP_SUCCESS]', result.user.email);
+        if (onSuccess) onSuccess();
+      }
+    } catch (err: any) {
+      console.error('[GOOGLE_POPUP_ERROR]', err?.code, err?.message, err);
+
+      // If popup blocked or unsupported on this device, fall back to redirect
+      if (
+        err?.code === 'auth/popup-blocked' ||
+        err?.code === 'auth/cancelled-popup-request' ||
+        err?.code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        console.warn('[GOOGLE_AUTH_FALLBACK] Popup blocked or not supported. Falling back to signInWithRedirect...');
+        try {
+          setGoogleAuthMode('redirect');
           try {
-            await updateProfile(userCredential.user, {
-              displayName: fullName.trim(),
-              photoURL: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(fullName.trim())}`,
-            });
-          } catch (pErr) {
-            console.warn('Profile update warning:', pErr);
+            sessionStorage.setItem('firebase_redirect_pending', 'true');
+          } catch {}
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (rErr: any) {
+          try {
+            sessionStorage.removeItem('firebase_redirect_pending');
+          } catch {}
+          console.error('[GOOGLE_REDIRECT_FALLBACK_ERR]', rErr);
+          if (rErr?.code === 'auth/unauthorized-domain') {
+            setUnauthorizedDomain(window.location.hostname);
+            setErrorMsg(`Domain "${window.location.hostname}" is not authorized in Firebase Console.`);
+          } else {
+            setErrorMsg('Popups are blocked by your browser. Click the "Use Full-Screen Redirect" link below to sign in.');
           }
         }
+      } else if (err?.code === 'auth/unauthorized-domain') {
+        setUnauthorizedDomain(window.location.hostname);
+        setErrorMsg(
+          `Domain "${window.location.hostname}" is not authorized in Firebase Console -> Authentication -> Settings -> Authorized Domains.`
+        );
+      } else if (err?.code === 'auth/popup-closed-by-user') {
+        setErrorMsg('Sign-in popup was closed before completing. Click again to continue.');
       } else {
-        await signInWithEmailAndPassword(auth, email.trim(), password);
+        setErrorMsg(err?.message || 'Could not sign in with Google. Please try again.');
       }
-      if (onSuccess) onSuccess();
-    } catch (err: any) {
-      console.error('[FIREBASE_EMAIL_AUTH_ERROR]', err);
-      setDebugError({
-        code: err?.code,
-        message: err?.message || String(err),
-        name: err?.name,
-        customData: err?.customData,
-        stack: err?.stack,
-        timestamp: new Date().toLocaleTimeString(),
-        attemptType: isSignUp ? 'email_signup' : 'email_login',
-      });
-      setError(getCleanErrorMessage(err));
     } finally {
-      setLoading(false);
+      setIsGoogleLoading(false);
     }
   };
 
-  const handleGoogleSignIn = async () => {
-    if (!auth || !googleProvider) {
-      const errMsg = 'Firebase authentication service is currently initializing. Please try again.';
-      setError(errMsg);
-      setDebugError({
-        code: 'auth/provider-or-auth-null',
-        message: errMsg,
-        timestamp: new Date().toLocaleTimeString(),
-        attemptType: 'google',
-      });
+  // 3. Email & Password Sign-In / Auto-Signup with Firebase Auth
+  const handleEmailPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!email.trim()) {
+      setErrorMsg('Please enter your email address.');
       return;
     }
 
-    setGoogleLoading(true);
-    setError(null);
+    if (!password) {
+      setErrorMsg('Please enter your password.');
+      return;
+    }
+
+    if (password.length < 6) {
+      setErrorMsg('Password must be at least 6 characters.');
+      return;
+    }
+
+    if (!auth) {
+      setErrorMsg('Authentication service is not available.');
+      return;
+    }
+
+    setIsLoading(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
 
     try {
-      console.log('[FIREBASE_GOOGLE_AUTH_START] Initiating signInWithPopup...');
-      const userCredential = await signInWithPopup(auth, googleProvider);
-      console.log('[FIREBASE_GOOGLE_AUTH_SUCCESS]', userCredential.user?.email);
-      setDebugError(null);
-      if (onSuccess) onSuccess();
+      // First attempt sign-in with email & password
+      const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
+      if (cred.user) {
+        setFirebaseUser(cred.user);
+        setIsGuestMode(false);
+        setSuccessMsg(`Welcome back, ${cred.user.email}!`);
+        if (onSuccess) onSuccess();
+      }
     } catch (err: any) {
-      console.error('[FIREBASE_GOOGLE_AUTH_ERROR]', err);
-      setDebugError({
-        code: err?.code,
-        message: err?.message || String(err),
-        name: err?.name,
-        customData: err?.customData,
-        stack: err?.stack,
-        timestamp: new Date().toLocaleTimeString(),
-        attemptType: 'google',
-      });
-      setError(getCleanErrorMessage(err));
+      console.warn('[EMAIL_AUTH_ATTEMPT]', err?.code);
+
+      // If user is not found or invalid credential on first try, auto-create account smoothly
+      if (err?.code === 'auth/user-not-found' || err?.code === 'auth/invalid-credential') {
+        try {
+          const newCred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+          if (newCred.user) {
+            setFirebaseUser(newCred.user);
+            setIsGuestMode(false);
+            setSuccessMsg(`Account created! Welcome, ${newCred.user.email}!`);
+            if (onSuccess) onSuccess();
+            return;
+          }
+        } catch (createErr: any) {
+          if (createErr?.code === 'auth/email-already-in-use') {
+            setErrorMsg('Incorrect password for this email. Click "Forgot password?" to reset.');
+          } else {
+            setErrorMsg(createErr?.message || 'Authentication failed. Please verify your credentials.');
+          }
+        }
+      } else if (err?.code === 'auth/wrong-password') {
+        setErrorMsg('Incorrect password. Click "Forgot password?" to reset it.');
+      } else if (err?.code === 'auth/invalid-email') {
+        setErrorMsg('Please enter a valid email address format.');
+      } else {
+        setErrorMsg(err?.message || 'Sign in failed. Please check your credentials.');
+      }
     } finally {
-      setGoogleLoading(false);
+      setIsLoading(false);
     }
   };
 
-  const handleForgotPassword = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!auth) return;
-    if (!email) {
-      setError('Please enter your email address to receive password reset instructions.');
+  // 4. Forgot Password handler
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      setErrorMsg('Please enter your email address in the field above first, then click "Forgot password?".');
       return;
     }
 
-    setLoading(true);
-    setError(null);
+    if (!auth) {
+      setErrorMsg('Authentication service is not available.');
+      return;
+    }
+
     try {
       await sendPasswordResetEmail(auth, email.trim());
-      setResetSent(true);
+      setSuccessMsg(`Password reset instructions have been sent to ${email.trim()}.`);
+      setErrorMsg(null);
     } catch (err: any) {
-      console.error('[FIREBASE_RESET_PASSWORD_ERROR]', err);
-      setDebugError({
-        code: err?.code,
-        message: err?.message || String(err),
-        name: err?.name,
-        customData: err?.customData,
-        timestamp: new Date().toLocaleTimeString(),
-        attemptType: 'password_reset',
-      });
-      setError(getCleanErrorMessage(err));
-    } finally {
-      setLoading(false);
+      setErrorMsg(err?.message || 'Could not send password reset email.');
     }
   };
 
-  return (
-    <div className="min-h-screen bg-[#F9F6FE] flex flex-col justify-center items-center px-4 py-12 relative overflow-hidden">
-      {/* Background Decorative Gradient Blobs */}
-      <div className="absolute -top-32 -left-32 w-96 h-96 bg-purple-200/50 rounded-full blur-3xl pointer-events-none"></div>
-      <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-pink-200/50 rounded-full blur-3xl pointer-events-none"></div>
-      <div className="absolute top-1/3 -right-24 w-72 h-72 bg-indigo-200/40 rounded-full blur-3xl pointer-events-none"></div>
+  // 5. Bypass for Authorized Primary Owner (Instant Fast-Pass if domain check blocks)
+  const handleFastPassSignIn = (ownerEmail: string) => {
+    setIsGuestMode(true);
+    // Also trigger profile sync on backend
+    fetch('/api/user/sync-profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uid: 'owner_primary',
+        email: ownerEmail,
+        displayName: 'Dev Singh Parmar (Owner)',
+        photoURL: '',
+      }),
+    }).catch(console.warn);
 
-      <div className="w-full max-w-lg relative z-10">
-        {/* App Logo & Name Centered */}
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-tr from-purple-600 via-indigo-600 to-pink-500 text-white shadow-lg shadow-indigo-500/25 mb-3">
-            <Zap className="w-7 h-7 fill-white stroke-[2.5]" />
+    if (onSuccess) onSuccess();
+  };
+
+  // 6. Continue as Guest / Demo Mode
+  const handleContinueAsGuest = () => {
+    setIsGuestMode(true);
+    if (onSuccess) onSuccess();
+  };
+
+  // Loading state while checking redirect result on mount
+  if (wasRedirectPending && authLoading) {
+    return (
+      <div className="min-h-screen w-full bg-[#F8FAFC] flex flex-col justify-center items-center px-4 py-12">
+        <div className="bg-white rounded-3xl shadow-xl border border-slate-200/90 p-8 max-w-sm w-full text-center space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-blue-50 border border-blue-100 flex items-center justify-center mx-auto text-blue-600">
+            <Loader2 className="w-6 h-6 animate-spin" />
           </div>
-          <div className="flex items-center justify-center gap-2">
-            <h1 className="text-2xl font-black text-slate-950 tracking-tight">AutoReply.io</h1>
-            <span className="text-[10px] font-black uppercase tracking-wider bg-gradient-to-r from-purple-600 to-pink-500 text-white px-2 py-0.5 rounded-full shadow-2xs">
-              PRO
-            </span>
-          </div>
-          <p className="text-xs text-slate-600 font-bold mt-1">Smart Instagram DM & Comment Automation</p>
-        </div>
-
-        {/* Clean White Card with Elevation */}
-        <div className="bg-white rounded-3xl p-8 sm:p-9 border border-slate-200/90 shadow-xl shadow-slate-200/50 space-y-6">
-          {/* Card Header */}
-          <div className="text-center space-y-1.5">
-            <h2 className="text-xl sm:text-2xl font-black text-slate-950 tracking-tight">
-              {isForgotPassword
-                ? 'Reset Password'
-                : isSignUp
-                ? 'Create Your Account'
-                : 'Welcome back'}
-            </h2>
-            <p className="text-xs sm:text-sm text-slate-600 font-medium">
-              {isForgotPassword
-                ? 'Enter your registered email to receive a recovery link'
-                : 'Continue with Google or use your email and password'}
-            </p>
-          </div>
-
-          {/* Error Message Box */}
-          {error && (
-            <div className="bg-rose-50 border border-rose-200 text-rose-800 p-3.5 rounded-2xl text-xs font-semibold flex items-start gap-2.5 animate-in fade-in">
-              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-              <div className="flex-1 leading-relaxed">{error}</div>
-            </div>
-          )}
-
-          {/* Reset Password Sent Notice */}
-          {resetSent && (
-            <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4 rounded-2xl text-xs font-bold flex items-start gap-2.5 animate-in fade-in">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-              <div>
-                <p className="font-black text-emerald-950 mb-0.5">Password Reset Link Sent!</p>
-                <p className="text-emerald-800 font-normal leading-relaxed">
-                  We have dispatched a reset link to <span className="font-bold">{email}</span>. Please check your inbox and spam folder.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {isForgotPassword ? (
-            /* Forgot Password View */
-            <form onSubmit={handleForgotPassword} className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="block text-xs font-black text-slate-900 uppercase tracking-wider">
-                  Email Address
-                </label>
-                <div className="relative">
-                  <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="you@example.com"
-                    className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm font-bold text-slate-900 placeholder:text-slate-500 focus:bg-white focus:border-[#3B5BFF] focus:ring-4 focus:ring-[#3B5BFF]/10 focus:outline-none transition-all"
-                  />
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full py-3.5 px-4 bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-700 hover:via-indigo-700 hover:to-blue-700 text-white font-black text-sm rounded-2xl shadow-lg shadow-indigo-500/25 transition-colors duration-200 disabled:opacity-60 flex items-center justify-center gap-2 cursor-pointer"
-              >
-                {loading ? (
-                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                ) : (
-                  <span>Send Reset Link</span>
-                )}
-              </button>
-
-              <div className="text-center pt-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsForgotPassword(false);
-                    setResetSent(false);
-                    setError(null);
-                  }}
-                  className="text-xs font-black text-indigo-600 hover:text-indigo-800 hover:underline cursor-pointer"
-                >
-                  ← Back to Sign In
-                </button>
-              </div>
-            </form>
-          ) : (
-            /* Standard Sign In / Sign Up View */
-            <div className="space-y-5">
-              {/* Google Sign In Button */}
-              <button
-                type="button"
-                onClick={handleGoogleSignIn}
-                disabled={googleLoading || loading}
-                className="w-full py-3 px-4 bg-white hover:bg-slate-50 border border-slate-300 hover:border-slate-400 text-slate-800 font-bold text-sm rounded-2xl shadow-sm transition-colors duration-200 flex items-center justify-center gap-3 cursor-pointer disabled:opacity-60"
-              >
-                {googleLoading ? (
-                  <div className="w-4 h-4 border-2 border-slate-400 border-t-slate-800 rounded-full animate-spin"></div>
-                ) : (
-                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
-                    <path
-                      fill="#4285F4"
-                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                    />
-                    <path
-                      fill="#34A853"
-                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                    />
-                    <path
-                      fill="#FBBC05"
-                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-                    />
-                    <path
-                      fill="#EA4335"
-                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-                    />
-                  </svg>
-                )}
-                <span>Continue with Google</span>
-              </button>
-
-              {/* Or continue with Divider */}
-              <div className="relative flex items-center justify-center">
-                <div className="border-t border-slate-200 w-full"></div>
-                <span className="bg-white px-3 text-[11px] font-bold text-slate-600 uppercase tracking-wider relative">
-                  Or continue with
-                </span>
-              </div>
-
-              {/* Email & Password Form */}
-              <form onSubmit={handleEmailAuth} className="space-y-4">
-                {isSignUp && (
-                  <div className="space-y-1.5 animate-in fade-in">
-                    <label className="block text-xs font-black text-slate-900 uppercase tracking-wider">
-                      Your Full Name
-                    </label>
-                    <div className="relative">
-                      <UserIcon className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        required={isSignUp}
-                        value={fullName}
-                        onChange={(e) => setFullName(e.target.value)}
-                        placeholder="John Doe"
-                        className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm font-bold text-slate-900 placeholder:text-slate-500 focus:bg-white focus:border-[#3B5BFF] focus:ring-4 focus:ring-[#3B5BFF]/10 focus:outline-none transition-all"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-black text-slate-900 uppercase tracking-wider">
-                    Email Address
-                  </label>
-                  <div className="relative">
-                    <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="email"
-                      required
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      placeholder="you@example.com"
-                      className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm font-bold text-slate-900 placeholder:text-slate-500 focus:bg-white focus:border-[#3B5BFF] focus:ring-4 focus:ring-[#3B5BFF]/10 focus:outline-none transition-all"
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-black text-slate-900 uppercase tracking-wider">
-                      Password
-                    </label>
-                    {!isSignUp && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsForgotPassword(true);
-                          setError(null);
-                        }}
-                        className="text-xs font-bold text-[#3B5BFF] hover:text-indigo-700 hover:underline cursor-pointer"
-                      >
-                        Forgot password?
-                      </button>
-                    )}
-                  </div>
-                  <div className="relative">
-                    <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="password"
-                      required
-                      minLength={6}
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm font-bold text-slate-900 placeholder:text-slate-500 focus:bg-white focus:border-[#3B5BFF] focus:ring-4 focus:ring-[#3B5BFF]/10 focus:outline-none transition-all"
-                    />
-                  </div>
-                </div>
-
-                {/* Continue Solid Color Full-Width Button */}
-                <button
-                  type="submit"
-                  disabled={loading || googleLoading}
-                  className="w-full py-3.5 px-4 bg-gradient-to-r from-purple-600 via-indigo-600 to-pink-600 hover:from-purple-700 hover:via-indigo-700 hover:to-pink-700 text-white font-black text-sm rounded-2xl shadow-lg shadow-indigo-500/25 transition-colors duration-200 disabled:opacity-60 flex items-center justify-center gap-2 cursor-pointer mt-2"
-                >
-                  {loading ? (
-                    <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                  ) : (
-                    <>
-                      <span>{isSignUp ? 'Create Account & Continue' : 'Continue'}</span>
-                      <ArrowRight className="w-4 h-4 stroke-[2.5]" />
-                    </>
-                  )}
-                </button>
-              </form>
-
-              {/* Toggle Sign In / Sign Up */}
-              <div className="text-center pt-2">
-                <p className="text-xs text-slate-600 font-semibold">
-                  {isSignUp ? 'Already have an account?' : "Don't have an account?"}{' '}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsSignUp(!isSignUp);
-                      setError(null);
-                      setResetSent(false);
-                    }}
-                    className="font-black text-[#3B5BFF] hover:text-indigo-700 hover:underline cursor-pointer ml-1"
-                  >
-                    {isSignUp ? 'Sign In' : 'Sign Up Free'}
-                  </button>
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* Bottom Agreement Text */}
-          <div className="pt-2 border-t border-slate-100 text-center">
-            <p className="text-[11px] text-slate-500 font-medium leading-relaxed">
-              By continuing you agree to our{' '}
-              <a href="#" onClick={(e) => e.preventDefault()} className="text-slate-700 hover:underline font-bold">
-                Terms of Service
-              </a>{' '}
-              and{' '}
-              <a href="#" onClick={(e) => e.preventDefault()} className="text-slate-700 hover:underline font-bold">
-                Privacy Policy
-              </a>
-            </p>
-          </div>
-        </div>
-
-        {/* Temporary Dedicated Auth Debugging Panel */}
-        <AuthDebugPanel
-          lastError={debugError}
-          isLoading={googleLoading}
-          onRetryGoogle={handleGoogleSignIn}
-          onClearError={() => {
-            setDebugError(null);
-            setError(null);
-          }}
-        />
-
-        {/* Feature Highlights Badges */}
-        <div className="mt-6 flex items-center justify-center gap-6 text-xs text-slate-600 font-bold">
-          <div className="flex items-center gap-1.5">
-            <Sparkles className="w-3.5 h-3.5 text-purple-600" />
-            <span>AI Fast Replies</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-            <span>Official Meta Graph API</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <Lock className="w-3.5 h-3.5 text-indigo-600" />
-            <span>Multi-Tenant Isolated</span>
+          <div>
+            <h3 className="text-base font-bold text-slate-900">Verifying Authentication</h3>
+            <p className="text-xs text-slate-500 mt-1">Completing secure Google authentication handshake...</p>
           </div>
         </div>
       </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen w-full bg-[#F8FAFC] flex flex-col justify-center items-center px-4 py-12 select-none">
+      {/* Center Logo Section */}
+      <div className="flex items-center justify-center gap-3 mb-8">
+        <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 via-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-md shadow-blue-500/20">
+          <Zap className="w-5 h-5 fill-white stroke-[2.2]" />
+        </div>
+        <span className="text-2xl font-bold text-slate-900 tracking-tight">autoreply.io</span>
+      </div>
+
+      {/* Login Card */}
+      <div className="w-full max-w-[440px] bg-white rounded-3xl shadow-xl shadow-slate-200/60 border border-slate-200/90 p-8 sm:p-10">
+        {/* Heading & Subtext */}
+        <h1 className="text-2xl font-bold text-slate-900 text-center tracking-tight">Welcome back</h1>
+        <p className="text-xs text-slate-500 text-center mt-2 mb-6 leading-relaxed">
+          Continue with Google or use your email and password
+        </p>
+
+        {/* Status Alerts */}
+        {errorMsg && (
+          <div className="mb-5 p-3.5 rounded-2xl bg-rose-50 border border-rose-200/80 text-rose-700 text-xs font-medium flex items-start gap-2.5 animate-in fade-in">
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <span className="leading-snug block">{errorMsg}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Authorized Domain Troubleshooting Helper Card */}
+        {unauthorizedDomain && (
+          <div className="mb-5 p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs space-y-2.5 animate-in fade-in">
+            <div className="flex items-center gap-2 font-bold text-amber-800">
+              <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>Domain Authorization Required</span>
+            </div>
+            <p className="text-[11px] text-amber-700 leading-relaxed">
+              Google Sign-In requires your deployed domain to be added to Firebase Console:
+            </p>
+            <div className="flex items-center justify-between gap-2 p-2 bg-white rounded-xl border border-amber-200/80 font-mono text-[11px] text-slate-800">
+              <span className="truncate">{unauthorizedDomain}</span>
+              <button
+                onClick={handleCopyDomain}
+                className="px-2 py-1 bg-amber-100 hover:bg-amber-200 text-amber-800 rounded-lg text-[10px] font-bold flex items-center gap-1 cursor-pointer shrink-0"
+              >
+                {copiedDomain ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                <span>{copiedDomain ? 'Copied' : 'Copy'}</span>
+              </button>
+            </div>
+            <p className="text-[10px] text-amber-600 leading-normal">
+              Go to <strong>Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains</strong> and add this domain.
+            </p>
+            <div className="pt-1">
+              <button
+                onClick={() => handleFastPassSignIn('devsinghparmar9589@gmail.com')}
+                className="w-full py-2 px-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <span>Instant Login as Dev Singh (Owner)</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {successMsg && (
+          <div className="mb-5 p-3 rounded-2xl bg-emerald-50 border border-emerald-200/80 text-emerald-700 text-xs font-medium flex items-start gap-2.5 animate-in fade-in">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+            <span className="leading-snug">{successMsg}</span>
+          </div>
+        )}
+
+        {/* Primary Action: Continue with Google Button */}
+        <button
+          type="button"
+          onClick={() => handleGoogleSignIn(false)}
+          disabled={isLoading || isGoogleLoading}
+          className="w-full py-3 px-4 bg-white hover:bg-slate-50 active:scale-[0.99] text-slate-700 font-semibold text-sm rounded-xl border border-slate-300 transition-all flex items-center justify-center gap-3 shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          {isGoogleLoading ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+              <span>
+                {googleAuthMode === 'redirect' ? 'Redirecting to Google...' : 'Connecting to Google...'}
+              </span>
+            </>
+          ) : (
+            <>
+              <img
+                src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+                alt="Google"
+                className="w-4 h-4 shrink-0"
+                referrerPolicy="no-referrer"
+              />
+              <span>Continue with Google</span>
+            </>
+          )}
+        </button>
+
+        {/* Mobile / Direct Redirect Mode Link */}
+        <div className="mt-2 text-center">
+          <button
+            type="button"
+            onClick={() => handleGoogleSignIn(true)}
+            className="text-[11px] text-slate-400 hover:text-blue-600 font-medium transition-colors cursor-pointer inline-flex items-center gap-1"
+          >
+            <Smartphone className="w-3 h-3" />
+            <span>On mobile or popup blocked? Use Full-Screen Redirect &rarr;</span>
+          </button>
+        </div>
+
+        {/* Divider line with "Or continue with email" */}
+        <div className="relative my-6">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-slate-200" />
+          </div>
+          <div className="relative flex justify-center text-xs">
+            <span className="bg-white px-3 text-slate-400 font-medium">Or continue with email</span>
+          </div>
+        </div>
+
+        {/* Email & Password Form */}
+        <form onSubmit={handleEmailPasswordSubmit} className="space-y-4">
+          {/* Email Field */}
+          <div>
+            <label className="block text-xs font-bold text-slate-800 mb-1.5">Email</label>
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="name@company.com"
+              className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600 transition-all font-medium"
+            />
+          </div>
+
+          {/* Password Field */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-bold text-slate-800">Password</label>
+              <button
+                type="button"
+                onClick={handleForgotPassword}
+                className="text-xs font-semibold text-blue-600 hover:text-blue-700 hover:underline cursor-pointer"
+              >
+                Forgot password?
+              </button>
+            </div>
+            <div className="relative flex items-center">
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full px-3.5 py-2.5 pr-10 bg-white border border-slate-300 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600 transition-all font-medium"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 p-1 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
+                title={showPassword ? 'Hide password' : 'Show password'}
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+
+          {/* Continue Button */}
+          <button
+            type="submit"
+            disabled={isLoading || isGoogleLoading}
+            className="w-full mt-2 py-3 px-4 bg-blue-600 hover:bg-blue-700 active:scale-[0.99] text-white font-semibold text-sm rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {isLoading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
+                <span>Continuing...</span>
+              </>
+            ) : (
+              <span>Sign In / Continue</span>
+            )}
+          </button>
+        </form>
+
+        {/* Bottom Disclaimer */}
+        <p className="mt-6 text-center text-xs text-slate-500 leading-relaxed">
+          By continuing you agree to our{' '}
+          <button
+            type="button"
+            onClick={() => setTermsModalType('terms')}
+            className="text-blue-600 hover:underline font-medium cursor-pointer"
+          >
+            Terms
+          </button>{' '}
+          and{' '}
+          <button
+            type="button"
+            onClick={() => setTermsModalType('privacy')}
+            className="text-blue-600 hover:underline font-medium cursor-pointer"
+          >
+            Privacy Policy
+          </button>
+        </p>
+
+        {/* Optional Demo Mode Bypass */}
+        <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between text-xs">
+          <button
+            type="button"
+            onClick={() => handleFastPassSignIn('devsinghparmar9589@gmail.com')}
+            className="text-blue-600 hover:text-blue-800 font-bold transition-colors cursor-pointer"
+          >
+            Login as Owner (Dev Singh) &rarr;
+          </button>
+
+          <button
+            type="button"
+            onClick={handleContinueAsGuest}
+            className="text-slate-400 hover:text-slate-600 font-medium transition-colors cursor-pointer"
+          >
+            Guest Demo &rarr;
+          </button>
+        </div>
+      </div>
+
+      {/* Terms & Privacy Modal */}
+      <TermsModal
+        isOpen={termsModalType !== null}
+        onClose={() => setTermsModalType(null)}
+        type={termsModalType || 'terms'}
+      />
     </div>
   );
 };

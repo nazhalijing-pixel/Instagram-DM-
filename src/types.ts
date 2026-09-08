@@ -87,6 +87,7 @@ export interface Contact {
   interactions: ContactInteraction;
   tags?: string[];
   status?: 'lead' | 'converted' | 'contacted';
+  is_test?: boolean;
 }
 
 export interface InboxMessage {
@@ -99,6 +100,7 @@ export interface InboxMessage {
   is_automated?: boolean;
   automation_id?: string;
   timestamp: string;
+  is_test?: boolean;
 }
 
 export interface MetaConfig {
@@ -116,6 +118,7 @@ export interface WebhookLogEvent {
   from_username: string;
   incoming_text: string;
   status: 'triggered' | 'ignored' | 'error' | 'success';
+  is_test?: boolean;
   matched_automation_name?: string;
   response_sent?: string;
   webhook_received_at?: string;
@@ -159,3 +162,73 @@ export interface GeminiApiKeyItem {
   errorCount: number;
   lastUsedAt?: string;
 }
+
+export interface PromptAnalysisResult {
+  role_identity: {
+    role: string;
+    persona: string;
+    target_audience: string;
+  };
+  behavior_tone: {
+    tone: string;
+    style_guidelines: string[];
+    emoji_usage: string;
+    reply_length_guideline: string;
+  };
+  primary_objectives: string[];
+  guardrails_constraints: string[];
+  knowledge_context: {
+    business_name_or_type?: string;
+    products_or_services: string[];
+    faqs_or_policies: string[];
+  };
+  quality_score: number; // 0 - 100
+  analysis_summary: string;
+  suggestions: string[];
+  enhanced_structured_prompt: string;
+}
+
+export interface AdminUserOverviewItem {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL?: string;
+  first_login_at: string;
+  last_login_at: string;
+  last_active_at: string;
+  role: 'admin' | 'user';
+  instagram: {
+    username?: string | null;
+    connected_at?: string | null;
+    status: 'active' | 'disconnected' | 'not_connected';
+    followers_count?: number;
+    profile_pic_url?: string | null;
+  };
+  stats: {
+    total_dms_sent: number;
+    total_automations: number;
+    total_contacts: number;
+    last_activity_time: string;
+  };
+}
+
+export interface AdminOverviewStats {
+  totalRegisteredUsers: number;
+  totalConnectedInstagram: number;
+  totalDmsSent: number;
+  totalActiveAutomations: number;
+}
+
+export interface AdminOverviewResponse {
+  success: boolean;
+  isAdmin: boolean;
+  requesterEmail: string;
+  overviewStats?: AdminOverviewStats;
+  users: AdminUserOverviewItem[];
+  totalUsers: number;
+  totalAutomatedDms: number;
+  totalAutomations: number;
+  configuredAdmins: string[];
+  error?: string;
+}
+

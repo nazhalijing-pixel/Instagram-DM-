@@ -76,6 +76,23 @@
         "id": { "type": "string" }
       },
       "required": ["id"]
+    },
+    "users": {
+      "title": "Registered Users",
+      "description": "Registered and authenticated users in the application",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "created_at": { "type": "string" },
+        "last_login_at": { "type": "string" },
+        "last_active_at": { "type": "string" },
+        "role": { "type": "string" }
+      },
+      "required": ["id", "email"]
     }
   }
 }

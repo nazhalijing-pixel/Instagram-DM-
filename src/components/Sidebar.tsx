@@ -11,19 +11,23 @@ import {
   ChevronLeft,
   ShieldCheck,
   Plus,
+  Info,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { UserAvatar } from './Common/UserAvatar';
 
 export const Sidebar: React.FC = () => {
   const {
     activeTab,
     setActiveTab,
     user,
+    firebaseUser,
     logout,
     instagramAccount,
     inboxMessages,
     setIsRenewModalOpen,
     setIsConnectModalOpen,
+    isAdmin,
   } = useApp();
 
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
@@ -43,13 +47,14 @@ export const Sidebar: React.FC = () => {
   }, [isCollapsed]);
 
   interface NavItem {
-    id: 'home' | 'automations' | 'contacts' | 'inbox' | 'settings';
+    id: 'home' | 'automations' | 'contacts' | 'inbox' | 'settings' | 'about' | 'admin';
     label: string;
     icon: React.ComponentType<{ className?: string }>;
     badge?: number;
+    tag?: string;
   }
 
-  const navItems: NavItem[] = [
+  const baseNavItems: NavItem[] = [
     { id: 'home', label: 'Home', icon: LayoutDashboard },
     { id: 'automations', label: 'Automations', icon: Zap },
     { id: 'contacts', label: 'Contacts', icon: Users },
@@ -60,7 +65,20 @@ export const Sidebar: React.FC = () => {
       badge: (inboxMessages || []).filter((m) => m?.direction === 'in').length,
     },
     { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'about', label: 'About Us', icon: Info },
   ];
+
+  const navItems: NavItem[] = isAdmin
+    ? [
+        ...baseNavItems,
+        {
+          id: 'admin',
+          label: 'Admin Panel',
+          icon: ShieldCheck,
+          tag: 'Owner',
+        },
+      ]
+    : baseNavItems;
 
   const isTrial = user?.plan === 'trial' || user?.plan === 'free';
 
@@ -114,13 +132,13 @@ export const Sidebar: React.FC = () => {
               }`}
             >
               <div className={`flex items-center ${isCollapsed ? 'justify-center' : 'gap-2.5 min-w-0'}`}>
-                <div className="relative shrink-0">
-                  <img
+                <div className="shrink-0">
+                  <UserAvatar
                     src={instagramAccount.profile_pic_url}
-                    alt={instagramAccount.username}
-                    className="w-8 h-8 rounded-full object-cover border border-slate-300 shadow-2xs"
+                    username={instagramAccount.username}
+                    showInstagramBadge={true}
+                    size="sm"
                   />
-                  <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-emerald-500 border-2 border-white rounded-full"></span>
                 </div>
                 {!isCollapsed && (
                   <div className="min-w-0">
@@ -195,7 +213,11 @@ export const Sidebar: React.FC = () => {
                       <span className="absolute -top-1 -right-1.5 w-2.5 h-2.5 bg-[#3B5BFF] rounded-full ring-2 ring-white"></span>
                     ) : null}
                   </div>
-                  {!isCollapsed && item.badge && item.badge > 0 ? (
+                  {!isCollapsed && item.tag ? (
+                    <span className="bg-amber-100 text-amber-800 border border-amber-300/60 text-[10px] font-bold px-1.5 py-0.5 rounded-md tracking-wider uppercase">
+                      {item.tag}
+                    </span>
+                  ) : !isCollapsed && item.badge && item.badge > 0 ? (
                     <span className="bg-[#3B5BFF] text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
                       {item.badge}
                     </span>
@@ -264,22 +286,31 @@ export const Sidebar: React.FC = () => {
               isCollapsed ? 'justify-center p-1.5' : 'justify-between p-2'
             } rounded-xl bg-slate-50 border border-slate-100`}
           >
-            <div className={`flex items-center ${isCollapsed ? 'justify-center' : 'gap-2.5 min-w-0'}`}>
-              <img
-                src={user.avatar_url || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80'}
-                alt={user.name}
-                className="w-9 h-9 rounded-full object-cover border border-slate-200 shrink-0"
+            <button
+              onClick={() => setActiveTab('settings')}
+              className={`flex items-center ${isCollapsed ? 'justify-center' : 'gap-2.5 min-w-0 text-left'} cursor-pointer group-hover:opacity-90`}
+              title="Account Settings"
+            >
+              <UserAvatar
+                src={instagramAccount?.profile_pic_url || user.avatar_url}
+                username={instagramAccount?.username || user.name}
+                showInstagramBadge={Boolean(instagramAccount?.username)}
+                size="md"
               />
               {!isCollapsed && (
                 <div className="min-w-0">
-                  <p className="text-xs font-bold text-slate-900 truncate">{user.name}</p>
+                  <p className="text-xs font-bold text-slate-900 truncate group-hover:text-indigo-600 transition-colors">
+                    {instagramAccount?.username ? `@${instagramAccount.username}` : user.name}
+                  </p>
                   <div className="flex items-center gap-1 text-[10px] text-slate-500">
                     <ShieldCheck className="w-3 h-3 text-emerald-500 shrink-0" />
-                    <span className="capitalize font-semibold text-emerald-700">{user.plan} Plan</span>
+                    <span className="capitalize font-semibold text-emerald-700">
+                      {instagramAccount ? 'Live Channel' : `${user.plan} Plan`}
+                    </span>
                   </div>
                 </div>
               )}
-            </div>
+            </button>
             {!isCollapsed && (
               <button
                 onClick={() => {

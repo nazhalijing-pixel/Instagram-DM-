@@ -12,6 +12,9 @@ import { AutomationBuilder } from './components/Automations/AutomationBuilder';
 import { ContactsPage } from './components/Contacts/ContactsPage';
 import { InboxPage } from './components/Inbox/InboxPage';
 import { SettingsPage } from './components/Settings/SettingsPage';
+import { AboutUsPage } from './components/About/AboutUsPage';
+import { AdminPage } from './components/Admin/AdminPage';
+import { LoginPage } from './components/Auth/LoginPage';
 
 const MainContent: React.FC = () => {
   const { activeTab } = useApp();
@@ -26,6 +29,8 @@ const MainContent: React.FC = () => {
         {activeTab === 'contacts' && <ContactsPage />}
         {activeTab === 'inbox' && <InboxPage />}
         {activeTab === 'settings' && <SettingsPage />}
+        {activeTab === 'about' && <AboutUsPage />}
+        {activeTab === 'admin' && <AdminPage />}
       </ErrorBoundary>
 
       {/* Modals & Overlays */}
@@ -39,9 +44,29 @@ const MainContent: React.FC = () => {
 };
 
 const AppShell: React.FC = () => {
+  const { firebaseUser, isGuestMode, authLoading } = useApp();
   const [showSplash, setShowSplash] = useState<boolean>(true);
 
-  // Directly display the application dashboard without any login wall
+  // If Firebase is still verifying the initial session and guest mode isn't already set, show brief splash
+  if (authLoading && !isGuestMode) {
+    return (
+      <ErrorBoundary>
+        <IntroSplash onComplete={() => {}} />
+      </ErrorBoundary>
+    );
+  }
+
+  // If user is not signed in and not in guest mode, render the Login Page
+  const isAuthenticated = Boolean(firebaseUser || isGuestMode);
+
+  if (!isAuthenticated) {
+    return (
+      <ErrorBoundary>
+        <LoginPage onSuccess={() => setShowSplash(false)} />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       {showSplash && <IntroSplash onComplete={() => setShowSplash(false)} />}
